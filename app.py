@@ -1036,8 +1036,10 @@ class ExecutorBridge:
         close_price: float,
         pnl: float = 0.0,
         url: Optional[str] = None,
-    ) -> None:
-        """Notifica cierre de posición al Executor sin bloquear el loop."""
+    ) -> Optional["asyncio.Task"]:
+        """Notifica cierre de posición al Executor sin bloquear el loop. Devuelve la
+        tarea del envío (None si no hay link o no hay loop) para quien necesite
+        esperar a que llegue, como la apertura de un trade de venganza."""
         payload = {
             "action":      "close",
             "trade_id":    trade_id,
@@ -1047,13 +1049,13 @@ class ExecutorBridge:
             "close_price": close_price,
             "pnl":         pnl,
         }
-        self.notify_async(payload, url)
+        return self.notify_async(payload, url)
 
-    def notify_async(self, payload: dict, url: Optional[str] = None) -> None:
-        """Dispara el envío sin bloquear el event loop."""
+    def notify_async(self, payload: dict, url: Optional[str] = None) -> Optional["asyncio.Task"]:
+        """Dispara el envío sin bloquear el event loop (devuelve su tarea, si la hay)."""
         target = (self.config.executor_url if url is None else self.normalize_url(url))
         if not target:
-            return
+            return None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1062,10 +1064,11 @@ class ExecutorBridge:
                 args=(payload, target),
                 daemon=True,
             ).start()
-            return
+            return None
         task = loop.create_task(self.send_signal_async(payload, target))
         self._tasks.add(task)                       # referencia viva hasta que termine
         task.add_done_callback(self._tasks.discard)
+        return task
 
 
 
@@ -1373,6 +1376,32 @@ class ModeSettings:
 
 MODE = ModeSettings()
 
+
+# ── Trade de venganza ─────────────────────────────────────────────────────────
+# Cuando una operación (normal o invertida) cierra por SU stop loss con una
+# pérdida dentro de [min_loss_usd, max_loss_usd] (por defecto de −1 a −2 USD: el
+# SL del 1.er tramo, 5 USDT × 0.251 = −1.255), el bot abre al instante en el mismo
+# símbolo la posición CONTRARIA con notional_mult × el notional con el que cerró:
+#   • TP fijo = la pérdida de la original (busca recuperarla)
+#   • SL fijo = sl_usd (−8)
+#   • sin DCA, y si la venganza pierde no se venga otra vez (sin cadenas)
+# Pasa por las mismas guardas que una entrada nueva (pausa, exposición, filtros
+# BTC sobre su lado real, memoria Upstash) y queda marcada (revenge) en las
+# posiciones, en el historial, en las estadísticas y en el CSV.
+@dataclass
+class RevengeSettings:
+    enabled:       bool  = _env_bool("REVENGE_ENABLED", True)
+    min_loss_usd:  float = float(os.getenv("REVENGE_MIN_LOSS_USD", "1"))     # pérdida desde (USD, positivo)
+    max_loss_usd:  float = float(os.getenv("REVENGE_MAX_LOSS_USD", "2"))     # pérdida hasta (USD, positivo)
+    notional_mult: float = float(os.getenv("REVENGE_NOTIONAL_MULT", "2"))    # × el notional de la original
+    sl_usd:        float = -abs(float(os.getenv("REVENGE_SL_USD", "-8")))    # SL fijo (USD, negativo)
+
+
+REVENGE = RevengeSettings()
+# Espera máxima a que el executor reciba el cierre de la original antes de mandarle
+# la apertura de la venganza (si llegan al revés, en modo one-way se netearían).
+REVENGE_EXEC_WAIT_S = float(os.getenv("REVENGE_EXEC_WAIT_S", "12"))
+
 # Validadores: clave → (tipo, función de validación que lanza ValueError)
 def _v_bool(v: Any) -> bool:
     if isinstance(v, bool):
@@ -1457,6 +1486,61 @@ def _apply_risk_dict(data: dict, strict: bool) -> Dict[str, Any]:
     return parsed
 
 
+def _v_loss_abs(v: Any) -> float:
+    """Pérdida en USD como importe positivo: acepta 1, -1 o "1,5"."""
+    try:
+        x = abs(float(str(v).replace(",", ".")))
+    except (TypeError, ValueError):
+        raise ValueError("El rango de pérdida de la venganza debe ser un número en USD (ej. 1)")
+    if x != x or not (0.01 <= x <= 100_000):
+        raise ValueError("El rango de pérdida de la venganza va de 0.01 a 100000 USD")
+    return x
+
+
+def _v_revenge_sl(v: Any) -> float:
+    """SL de la venganza en USD, siempre negativo: acepta 8 o -8."""
+    try:
+        x = -abs(float(str(v).replace(",", ".")))
+    except (TypeError, ValueError):
+        raise ValueError("El stop loss de la venganza debe ser un número en USD (ej. -8)")
+    if x != x or not (-100_000 <= x <= -0.01):
+        raise ValueError("El stop loss de la venganza va de -0.01 a -100000 USD")
+    return x
+
+
+REVENGE_FIELDS = {
+    "enabled":       _v_bool,
+    "min_loss_usd":  _v_loss_abs,
+    "max_loss_usd":  _v_loss_abs,
+    "notional_mult": _v_float(0.1, 20, "El multiplicador del notional de la venganza va de 0.1 a 20 (ej. 2)"),
+    "sl_usd":        _v_revenge_sl,
+}
+
+
+def _apply_revenge_dict(data: dict, strict: bool) -> Dict[str, Any]:
+    """Valida y aplica las claves conocidas de `data` sobre REVENGE.
+    strict=True → ValueError ante el primer valor inválido (sin aplicar nada)."""
+    parsed: Dict[str, Any] = {}
+    for key, fn in REVENGE_FIELDS.items():
+        if key not in data:
+            continue
+        try:
+            parsed[key] = fn(data[key])
+        except ValueError:
+            if strict:
+                raise
+    lo = parsed.get("min_loss_usd", REVENGE.min_loss_usd)
+    hi = parsed.get("max_loss_usd", REVENGE.max_loss_usd)
+    if lo > hi + 1e-12:
+        if strict:
+            raise ValueError(f"El rango de pérdida no vale: desde {lo:g} USD es mayor que hasta {hi:g} USD")
+        parsed.pop("min_loss_usd", None)
+        parsed.pop("max_loss_usd", None)
+    for key, val in parsed.items():
+        setattr(REVENGE, key, val)
+    return parsed
+
+
 _SETTINGS_SOURCE = "none"     # "file" si al arrancar había ajustes guardados desde la web
 
 
@@ -1512,6 +1596,9 @@ def _apply_settings_dict(data: dict) -> None:
             MODE.changed_at = float(md.get("changed_at", 0) or 0)
         except Exception:
             MODE.changed_at = 0.0
+    rv = data.get("revenge")
+    if isinstance(rv, dict):
+        _apply_revenge_dict(rv, strict=False)
     ex = data.get("executor")
     if isinstance(ex, dict):
         try:
@@ -1565,6 +1652,7 @@ def _settings_dict() -> dict:
         "risk":                  asdict(RISK),
         "executor":              asdict(EXEC),
         "mode":                  asdict(MODE),
+        "revenge":               asdict(REVENGE),
     }
 
 
@@ -1630,6 +1718,13 @@ class BotPosition:
     #   • DCA en los mismos precios que el normal (para ella, a favor)
     #   • TP = −(SL del normal)   · SL = −(TP del normal) = −notional × multiplicador
     inverted:     bool  = False
+    # Trade de venganza: se abrió al revés de una operación que cerró por SL con
+    # ~−1 USD, con el doble de su notional. TP y SL fijos en USD y sin DCA.
+    revenge:        bool  = False
+    revenge_of:     int   = 0       # trade_id de la operación que venga
+    revenge_loss:   float = 0.0     # PnL con el que cerró esa operación (negativo)
+    revenge_tp_usd: float = 0.0     # TP (USD, positivo): la pérdida a recuperar, o el fijado a mano
+    revenge_sl_usd: float = 0.0     # SL automático de la venganza (USD, negativo)
     # ── Excursiones de la operación (PnL no realizado, USD y % del notional) ──
     opened_ts:    float = field(default_factory=time.time)
     mfe_usd:      float = 0.0    # máximo a favor  (>= 0)
@@ -1703,14 +1798,19 @@ class BotPosition:
     # ── Salidas en PnL REAL de la posición ───────────────────────────────────
     def exit_tp(self) -> float:
         """Take profit en USD (positivo). Normal: notional × multiplicador del TP.
-        Invertida: espejo del SL del normal (1 tramo → notional×0.251, 2+ → |SL estándar|)."""
+        Invertida: espejo del SL del normal (1 tramo → notional×0.251, 2+ → |SL estándar|).
+        Venganza: la pérdida de la operación que venga (o el TP fijado a mano)."""
+        if self.revenge:
+            return self.revenge_tp_usd
         if self.inverted:
             return -self.sl_usd
         return self.notional * TAKE_PROFIT_FRACTION
 
     def exit_sl(self) -> float:
-        """Stop loss en USD (negativo). Normal: sl_usd. Invertida: espejo del TP
-        del normal = −notional × multiplicador del TP."""
+        """Stop loss en USD (negativo). Normal y venganza: sl_usd. Invertida: espejo
+        del TP del normal = −notional × multiplicador del TP."""
+        if self.revenge:
+            return self.sl_usd
         if self.inverted:
             return -self.notional * TAKE_PROFIT_FRACTION
         return self.sl_usd
@@ -1753,7 +1853,10 @@ class BotPosition:
     def auto_sl_usd(self) -> float:
         """1 solo tramo → -(notional del primer fill × 0.251).
         2 o más tramos → SL estándar (DEFAULT_STOP_LOSS_USD).
-        En una posición invertida este valor con el signo cambiado es su TP."""
+        En una posición invertida este valor con el signo cambiado es su TP.
+        Venganza → su SL fijo (−8 por defecto), tenga los tramos que tenga."""
+        if self.revenge:
+            return self.revenge_sl_usd if self.revenge_sl_usd < 0 else -abs(REVENGE.sl_usd)
         if len(self.fills) == 1:
             return -abs(self.fills[0].notional) * FIRST_TRANCHE_SL_FRACTION
         return DEFAULT_STOP_LOSS_USD
@@ -1767,7 +1870,14 @@ class BotPosition:
     def sl_mode(self) -> str:
         if self.sl_manual:
             return "manual"
+        if self.revenge:
+            return "venganza"
         return "1er tramo" if len(self.fills) == 1 else "estándar"
+
+    @property
+    def revenge_tp_manual(self) -> bool:
+        """True si el TP de la venganza ya no es la pérdida de la original (editado a mano)."""
+        return self.revenge and abs(self.revenge_tp_usd + self.revenge_loss) > 1e-9
 
 
 _POS_FIELDS = {f.name for f in fields(BotPosition)}
@@ -1795,9 +1905,13 @@ def _position_from_dict(d: Any) -> Optional[BotPosition]:
         pos = BotPosition(symbol=str(d["symbol"]).upper(), fills=fills, **kw)
         pos.status = "OPEN"
         pos.trade_id = int(pos.trade_id or 0)
-        for k in ("sl_usd", "realized_pnl", "opened_ts") + _POS_VOLATILE:
+        for k in ("sl_usd", "realized_pnl", "opened_ts",
+                  "revenge_loss", "revenge_tp_usd", "revenge_sl_usd") + _POS_VOLATILE:
             setattr(pos, k, float(getattr(pos, k) or 0.0))
         pos.sl_manual, pos.inverted = bool(pos.sl_manual), bool(pos.inverted)
+        pos.revenge, pos.revenge_of = bool(pos.revenge), int(pos.revenge_of or 0)
+        if pos.revenge and pos.revenge_tp_usd <= 0:      # venganza sin TP válido: el de su pérdida
+            pos.revenge_tp_usd = abs(pos.revenge_loss) or REVENGE.min_loss_usd
         if pos.direction not in ("LONG", "SHORT"):
             return None
         return pos
@@ -1812,7 +1926,7 @@ def _position_from_dict(d: Any) -> Optional[BotPosition]:
 # UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN el bot guarda en Upstash
 # Redis (gratis) todo lo necesario para seguir donde estaba:
 #   {STORE_PREFIX}:config  ajustes de la web: EMAs, SL, TP, escalera DCA, riesgo,
-#                          pausas, link del executor y modo invertido
+#                          pausas, link del executor, modo invertido y venganza
 #   {STORE_PREFIX}:state   posiciones abiertas con TODOS sus datos (tramos, SL o TP
 #                          manual, trade_id, executor, MFE/MAE…), cooldowns,
 #                          contador de trade_id, PnL realizado y stop global
@@ -2695,6 +2809,10 @@ class TradingBot:
         self._ema_cache: Dict[str, Tuple[tuple, Optional[float]]] = {}   # EMA de tendencia del DCA
         self._block_seen: Dict[str, float] = {}              # anti-spam por (símbolo, tipo)
 
+        # ── Trade de venganza (contadores desde el arranque, para la web) ──
+        self.revenge_counts: Dict[str, int] = {"opened": 0, "blocked": 0}
+        self.revenge_last:   Dict[str, Any] = {}
+
         # ── Memoria externa (Upstash Redis): config, posiciones, cierres… ──
         self.store = StateStore(UPSTASH_URL, UPSTASH_TOKEN, STORE_PREFIX)
         self.store.bot = self
@@ -2818,6 +2936,10 @@ class TradingBot:
         # Memoria externa: ajustes, posiciones abiertas, cierres, estadísticas y
         # cooldowns ANTES de conectar con Binance y de evaluar nada.
         await self._store_boot()
+        r = REVENGE
+        self.log(f"⚔️ VENGANZA {'activa' if r.enabled else 'apagada'}: SL con pérdida de −{r.min_loss_usd:g} a "
+                 f"−{r.max_loss_usd:g} USD → posición contraria con {r.notional_mult:g}× el notional, "
+                 f"TP = la pérdida, SL {r.sl_usd:g} USD, sin DCA ni venganza de la venganza")
         if QSTASH_TOKEN:
             threading.Thread(target=_qstash_keepalive, args=(self.store, self.log),
                              daemon=True, name="QStashKeepAlive").start()
@@ -3133,24 +3255,27 @@ class TradingBot:
         return None
 
     def _record_block(self, symbol: str, side: str, kind: str, detail: str,
-                      is_dca: bool, extra: str = "") -> None:
-        """Registra una señal frenada (máx. 1 vez por minuto por símbolo y tipo)."""
+                      is_dca: bool, extra: str = "", what: str = "", log: bool = True) -> None:
+        """Registra una señal frenada (máx. 1 vez por minuto por símbolo y tipo).
+        `what` = qué se frenó ("DCA", "entrada" o "venganza"); por defecto se deduce.
+        log=False → no lo apunta en el log (quien llama ya escribe su propio aviso)."""
         now = time.time()
-        key = f"{symbol}|{kind}|{int(is_dca)}"
+        what = what or ("DCA" if is_dca else "entrada")
+        key = f"{symbol}|{kind}|{int(is_dca)}|{what}"
         if now - self._block_seen.get(key, 0.0) < 60.0:
             return
         self._block_seen[key] = now
         if len(self._block_seen) > 2000:
             self._block_seen = {k: t for k, t in self._block_seen.items() if now - t < 60.0}
-        what = "DCA" if is_dca else "entrada"
         with self._block_lock:
             self.blocked_counts[kind] = self.blocked_counts.get(kind, 0) + 1
             self.blocked_recent.appendleft({
                 "ts": now, "symbol": symbol, "side": side, "kind": kind,
                 "detail": detail, "what": what, "extra": extra,
             })
-        self._log_throttled(f"blk_{kind}",
-                            f"⏸ {what} {side} {symbol} frenada ({kind}): {detail}", 30.0)
+        if log:
+            self._log_throttled(f"blk_{kind}",
+                                f"⏸ {what} {side} {symbol} frenada ({kind}): {detail}", 30.0)
 
     # ── Símbolos operables (caché en disco + REST) ────────────────────────────
 
@@ -3575,6 +3700,8 @@ class TradingBot:
             pos = self.positions.get(symbol)
             if pos is None or pos.status != "OPEN" or not pos.fills:
                 return
+            if pos.revenge:                   # el trade de venganza no hace DCA
+                return
             trigger   = pos.trigger_pct(price)
             direction = pos.direction
             inverted  = pos.inverted
@@ -3680,25 +3807,34 @@ class TradingBot:
     # ── Estrategia ────────────────────────────────────────────────────────────
 
     async def _ensure_position(self, symbol: str, idx: int, level: float, notional: float,
-                               price: float, direction: str, inverted: bool = False) -> bool:
+                               price: float, direction: str, inverted: bool = False,
+                               revenge: Optional[dict] = None) -> bool:
         """Abre el tramo de índice `idx` (0 = entrada del cruce). True si se abrió.
         `direction` es el lado REAL de la orden; `inverted` marca la posición espejo.
+        `revenge` (plan de _revenge_plan) abre un trade de venganza: posición nueva
+        de un solo tramo, que no espera al cooldown que acaba de dejar la original.
         El tramo se RESERVA antes de enviar la orden para que ningún tick lo
         duplique mientras está en vuelo."""
         key = (symbol, idx)
         is_dca = idx > 0
         blocked: Optional[Tuple[str, str]] = None
+
+        def _fail(why: str) -> bool:
+            if revenge is not None:
+                revenge["fail"] = why
+            return False
+
         with self.lock:
-            if self.symbol_cooldown.get(symbol, 0.0) > time.time():
+            if revenge is None and self.symbol_cooldown.get(symbol, 0.0) > time.time():
                 return False
             if symbol in self._closing_symbols or key in self._entry_reserved:
-                return False
+                return _fail("el símbolo tiene una orden en curso")
             pos = self.positions.get(symbol)
             if idx == 0:
                 if pos is not None:                       # ya hay posición: el cruce no abre otra
-                    return False
+                    return _fail("ya hay una posición abierta en el símbolo")
             elif (pos is None or pos.status != "OPEN" or pos.direction != direction
-                  or pos.inverted != inverted
+                  or pos.inverted != inverted or pos.revenge or revenge is not None
                   or len(pos.fills) != idx):              # el tramo idx solo sigue al idx-1
                 return False
             # Comprobación definitiva de las guardas (con la exposición real, incluidas
@@ -3709,6 +3845,11 @@ class TradingBot:
                 trade_id = pos.trade_id if (pos is not None and pos.trade_id) else 0
                 self._entry_reserved[key] = notional
         if blocked is not None:
+            if revenge is not None:
+                self._record_block(symbol, direction, blocked[0], blocked[1], is_dca=False,
+                                   extra=f"de #{revenge['orig_trade_id']}",
+                                   what="venganza", log=False)
+                return _fail(f"{blocked[0]}: {blocked[1]}")
             self._record_block(symbol, direction, blocked[0], blocked[1], is_dca=is_dca,
                                extra=f"tramo {idx + 1} al {level:g}%")
             return False
@@ -3721,8 +3862,10 @@ class TradingBot:
             except Exception as exc:
                 self.last_error = str(exc)
                 self._entry_backoff[symbol] = time.time() + ENTRY_ERROR_BACKOFF_S
-                self.log(f"Error abriendo {direction} {symbol} tramo {idx + 1} ({level:g}%): {exc}")
-                return False
+                what = (f"venganza de #{revenge['orig_trade_id']}" if revenge is not None
+                        else f"tramo {idx + 1} ({level:g}%)")
+                self.log(f"Error abriendo {direction} {symbol} {what}: {exc}")
+                return _fail(f"error al abrir: {exc}")
 
             fill = Fill(level=level, notional=notional, entry_price=price, qty=qty)
             exec_note = ""
@@ -3731,6 +3874,15 @@ class TradingBot:
                 if pos is None:
                     pos = BotPosition(symbol=symbol, trade_id=trade_id, direction=direction,
                                       inverted=inverted)
+                    if revenge is not None:
+                        pos.revenge        = True
+                        pos.revenge_of     = int(revenge["orig_trade_id"])
+                        pos.revenge_loss   = float(revenge["orig_pnl"])
+                        pos.revenge_tp_usd = float(revenge["tp_usd"])
+                        pos.revenge_sl_usd = float(revenge["sl_usd"])
+                        # La venganza sustituye al cooldown que dejó la original: al
+                        # cerrarse ella, el símbolo entra en su propio cooldown.
+                        self.symbol_cooldown.pop(symbol, None)
                     # Posición NUEVA: va al executor salvo que su envío esté en pausa
                     pos.exec_url, exec_note = self._exec_target_new()
                     self.positions[symbol] = pos
@@ -3745,19 +3897,29 @@ class TradingBot:
                 exec_target = pos.exec_url      # DCA → al mismo executor que la apertura
 
             self._watch_add(symbol)             # la posición abierta siempre queda vigilada
-            if inverted:
-                exits = f"TP={tp_now:+.4f} USD ({sl_mode}) | SL={sl_now:.4f} USD (−notional×TP)"
-                where = f"{level:g}% a favor" if idx > 0 else "entrada"
+            no_exec = ("" if exec_target else
+                       f" | sin executor ({exec_note or 'la posición no se envió al executor'})")
+            if revenge is not None:
+                self.log(
+                    f"⚔️ VENGANZA de #{revenge['orig_trade_id']} ({revenge['orig_direction']}"
+                    f"{' invertida' if revenge.get('orig_inverted') else ''} cerró por SL con "
+                    f"{revenge['orig_pnl']:+.4f} USD) → {direction} {symbol} | {notional:.2f} USDT "
+                    f"({revenge['mult']:g}× {revenge['orig_notional']:.2f}) | qty={qty} | px={price:.6f} | "
+                    f"trade_id={trade_id} | TP=+{tp_now:.4f} USD (recupera la pérdida) | "
+                    f"SL={sl_now:.4f} USD | sin DCA" + no_exec
+                )
             else:
-                exits = f"SL={sl_now:.4f} USD ({sl_mode})"
-                where = f"{level:g}% en contra"
-            self.log(
-                f"{direction} {symbol}{' INVERTIDA' if inverted else ''}: tramo {idx + 1} ({where}) | "
-                f"{notional:.2f} USDT | qty={qty} | px={price:.6f} | trade_id={trade_id} | "
-                f"tramos={n_fills} | {exits}"
-                + ("" if exec_target else
-                   f" | sin executor ({exec_note or 'la posición no se envió al executor'})")
-            )
+                if inverted:
+                    exits = f"TP={tp_now:+.4f} USD ({sl_mode}) | SL={sl_now:.4f} USD (−notional×TP)"
+                    where = f"{level:g}% a favor" if idx > 0 else "entrada"
+                else:
+                    exits = f"SL={sl_now:.4f} USD ({sl_mode})"
+                    where = f"{level:g}% en contra"
+                self.log(
+                    f"{direction} {symbol}{' INVERTIDA' if inverted else ''}: tramo {idx + 1} ({where}) | "
+                    f"{notional:.2f} USDT | qty={qty} | px={price:.6f} | trade_id={trade_id} | "
+                    f"tramos={n_fills} | {exits}" + no_exec
+                )
             if exec_target:
                 self.executor.notify_open(
                     trade_id=trade_id,
@@ -3777,9 +3939,12 @@ class TradingBot:
 
     async def _close_position(self, symbol: str, price: float, reason: str,
                               acquired: bool = False) -> bool:
-        """Cierre único para TP / SL / MANUAL (antes había 3 copias del mismo código)."""
+        """Cierre único para TP / SL / MANUAL (antes había 3 copias del mismo código).
+        Si la posición cierra por su SL con una pérdida del rango de la venganza,
+        al terminar lanza el trade de venganza (posición contraria, ver REVENGE)."""
         if not acquired and not self._begin_close_guard(symbol):
             return False
+        revenge_plan: Optional[dict] = None
         try:
             with self.lock:
                 pos = self.positions.get(symbol)
@@ -3793,6 +3958,9 @@ class TradingBot:
                 trade_id  = pos.trade_id
                 direction = pos.direction
                 inverted  = pos.inverted
+                is_rev    = pos.revenge         # trade de venganza (TP/SL fijos, sin DCA)
+                rev_of    = pos.revenge_of
+                rev_loss  = pos.revenge_loss
                 sl_usd    = pos.exit_sl()       # SL y TP en PnL real (en una invertida, en espejo)
                 target    = pos.exit_tp()
                 exec_url  = pos.exec_url        # el cierre va al executor donde se abrió
@@ -3813,11 +3981,17 @@ class TradingBot:
                     "mae_pct":    pos.mae_pct,
                     "duration_s": duration,
                 }
+                # Bandera de venganza (igual que "inverted"): va en el historial,
+                # en las estadísticas y en el CSV. revenge_of = trade que vengaba.
+                rev = {"revenge": is_rev}
+                if is_rev:
+                    rev.update(revenge_of=rev_of, revenge_loss=rev_loss, revenge_net=pnl + rev_loss)
                 stat_rec = {
                     "trade_id":      trade_id,
                     "symbol":        symbol,
                     "direction":     direction,
                     "inverted":      inverted,
+                    **rev,
                     "signal_dir":    _opp(direction) if inverted else direction,
                     "reason":        reason,
                     "opened_at_ts":  pos.opened_ts,
@@ -3882,6 +4056,7 @@ class TradingBot:
                         "trade_id":    trade_id,
                         "direction":   direction,
                         "inverted":    inverted,
+                        **rev,
                         "fills_n":     fills_n,
                         "pnl":         pnl,
                         "target":      target,
@@ -3901,8 +4076,9 @@ class TradingBot:
 
             self._record_trade_stat(stat_rec)
             self.store.push_closed(closed_rec, stat_rec)       # a la memoria externa (Upstash)
+            close_task = None
             if exec_url:
-                self.executor.notify_close(
+                close_task = self.executor.notify_close(
                     trade_id=trade_id,
                     symbol=symbol,
                     direction=direction,
@@ -3912,16 +4088,29 @@ class TradingBot:
                     pnl=pnl,
                     url=exec_url,
                 )
+            # ¿Toca trade de venganza? Solo si la posición quedó cerrada del todo
+            if closed_rec is not None and not leftover:
+                revenge_plan = self._revenge_plan(symbol, reason, pnl, direction, inverted,
+                                                  notional, trade_id, is_rev)
+                if revenge_plan is not None:
+                    revenge_plan["close_task"] = close_task
             tag = " (invertida)" if inverted else ""
+            if is_rev:
+                tag += f" (venganza de #{rev_of}: neto con la original {pnl + rev_loss:+.4f} USD)"
+            cd_txt = f"bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+            if revenge_plan is not None:
+                cd_txt = (f"→ ⚔️ VENGANZA en marcha: {revenge_plan['direction']} "
+                          f"{revenge_plan['notional']:.2f} USDT, TP +{revenge_plan['tp_usd']:.4f} USD, "
+                          f"SL {revenge_plan['sl_usd']:.2f} USD")
             if reason == "TP":
                 self.log(
                     f"CIERRE TP {symbol}{tag}: PnL={pnl:.4f} | objetivo={target:.4f} | "
-                    f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+                    f"px={price:.6f} | {cd_txt}"
                 )
             elif reason == "SL":
                 self.log(
                     f"⛔ STOP LOSS {symbol}{tag}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
-                    f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+                    f"px={price:.6f} | {cd_txt}"
                 )
             elif reason == "GLOBAL":
                 self.log(
@@ -3945,6 +4134,179 @@ class TradingBot:
             return True
         finally:
             self._end_close_guard(symbol)
+            if revenge_plan is not None:        # con el símbolo ya libre
+                self._spawn(self._open_revenge(revenge_plan))
+
+    # ── Trade de venganza ─────────────────────────────────────────────────────
+    #
+    # Operación que cierra por SU stop loss con una pérdida dentro del rango
+    # (REVENGE.min_loss_usd … max_loss_usd, por defecto 1 a 2 USD) → en el mismo
+    # símbolo se abre la posición CONTRARIA con REVENGE.notional_mult × el notional
+    # con el que cerró, TP = esa pérdida (la recupera) y SL = REVENGE.sl_usd.
+    # La venganza no hace DCA y, si pierde, no se venga otra vez.
+
+    @staticmethod
+    def _revenge_plan(symbol: str, reason: str, pnl: float, direction: str, inverted: bool,
+                      notional: float, trade_id: int, was_revenge: bool) -> Optional[dict]:
+        """Plan del trade de venganza para un cierre, o None si no toca."""
+        if not REVENGE.enabled or reason != "SL" or was_revenge or pnl >= 0:
+            return None
+        loss = -pnl
+        if not (REVENGE.min_loss_usd - 1e-9 <= loss <= REVENGE.max_loss_usd + 1e-9):
+            return None
+        mult = REVENGE.notional_mult
+        return {
+            "symbol":         symbol,
+            "direction":      _opp(direction),        # la posición contraria a la original (lado real)
+            "notional":       round(notional * mult, 8),
+            "mult":           mult,
+            "tp_usd":         loss,                    # busca recuperar lo perdido
+            "sl_usd":         -abs(REVENGE.sl_usd),
+            "orig_trade_id":  int(trade_id or 0),
+            "orig_pnl":       pnl,
+            "orig_direction": direction,
+            "orig_inverted":  bool(inverted),
+            "orig_notional":  notional,
+            "ts":             time.time(),
+        }
+
+    def _revenge_note(self, plan: dict, ok: bool, detail: str = "", kind: str = "") -> None:
+        """Contadores y última venganza (para la web) + aviso en el log si no se abrió."""
+        key = "opened" if ok else "blocked"
+        self.revenge_counts[key] = self.revenge_counts.get(key, 0) + 1
+        self.revenge_last = {
+            "ts": time.time(), "symbol": plan["symbol"], "side": plan["direction"],
+            "orig_trade_id": plan["orig_trade_id"], "orig_pnl": plan["orig_pnl"],
+            "notional": plan["notional"], "ok": ok, "kind": kind, "detail": detail,
+        }
+        if not ok:
+            self.log(f"⚔️ Venganza de #{plan['orig_trade_id']} {plan['direction']} {plan['symbol']} "
+                     f"frenada: no se abrió ({detail})")
+
+    async def _open_revenge(self, plan: dict) -> None:
+        """Abre el trade de venganza de un plan (_revenge_plan). Corre como tarea."""
+        symbol, side = plan["symbol"], plan["direction"]
+        if symbol in self._entry_inflight:
+            self._revenge_note(plan, False, "el símbolo ya tiene una entrada en curso", "posicion")
+            return
+        self._entry_inflight.add(symbol)      # cuenta como orden en vuelo (cruces, DCA y apagado)
+        opened = False
+        try:
+            # 1) El executor debe recibir el cierre de la original ANTES de la apertura de
+            #    la venganza: en modo one-way, al revés, se netearían en Binance.
+            task = plan.pop("close_task", None)
+            if task is not None and not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=REVENGE_EXEC_WAIT_S)
+                except Exception:
+                    pass                      # el envío tiene su propio timeout y registra su error
+            # 2) Guardas: las mismas que una entrada nueva (sobre el lado real de la venganza)
+            if not self.running:
+                return
+            if not REVENGE.enabled:           # se apagó mientras esperaba al executor
+                self._revenge_note(plan, False, "la venganza se desactivó", "apagada")
+                return
+            if not self.store.entries_ok:
+                if self.store.manage_ok:
+                    self._record_block(symbol, side, "memoria", self.store.block_text(), is_dca=False,
+                                       extra=f"de #{plan['orig_trade_id']}",
+                                       what="venganza", log=False)
+                self._revenge_note(plan, False, self.store.block_text() or "memoria no disponible", "memoria")
+                return
+            if self._close_all_active:
+                self._record_block(symbol, side, "cierre", "cierre masivo en curso", is_dca=False,
+                                   extra=f"de #{plan['orig_trade_id']}",
+                                   what="venganza", log=False)
+                self._revenge_note(plan, False, "cierre masivo en curso", "cierre")
+                return
+            with self.lock:
+                busy = (self.positions.get(symbol) is not None or symbol in self._closing_symbols
+                        or symbol in self.price_blocked)
+            if busy:
+                self._revenge_note(plan, False, "el símbolo ya tiene posición o está bloqueado", "posicion")
+                return
+            price = None
+            for _ in range(10):               # hasta ~5 s esperando un precio fresco
+                price = self._price_for(symbol)
+                if price:
+                    break
+                await asyncio.sleep(0.5)
+            if not price or price <= 0:
+                self._record_block(symbol, side, "precio", "sin precio fresco", is_dca=False,
+                                   extra=f"de #{plan['orig_trade_id']}",
+                                   what="venganza", log=False)
+                self._revenge_note(plan, False, "sin precio fresco", "precio")
+                return
+            if MAX_PRICE_BLOCK > 0 and price > MAX_PRICE_BLOCK:
+                self._block_by_price(symbol, price)
+                self._revenge_note(plan, False, f"precio {price:.6g} > {MAX_PRICE_BLOCK:g}", "precio")
+                return
+            # 3) Apertura (con la reserva y la comprobación definitiva de las guardas)
+            opened = await self._ensure_position(symbol, 0, 0.0, plan["notional"], price, side,
+                                                 inverted=False, revenge=plan)
+            if opened:
+                self._revenge_note(plan, True)
+            else:
+                why = plan.get("fail") or "no se pudo abrir"
+                self._revenge_note(plan, False, why, why.split(":", 1)[0] if ":" in why else "")
+        finally:
+            self._entry_inflight.discard(symbol)
+            if opened:                        # TP/SL con el precio de ahora mismo
+                self._enqueue(symbol)
+
+    def revenge_view(self) -> dict:
+        """Ajustes y estado del trade de venganza (para la web)."""
+        with self.lock:
+            open_rev = sorted(sym for sym, p in self.positions.items()
+                              if p.status == "OPEN" and p.fills and p.revenge)
+        first_nt = ENTRY_LADDER[0][1] if ENTRY_LADDER else 0.0
+        first_sl = abs(first_nt) * FIRST_TRANCHE_SL_FRACTION      # pérdida típica: SL del 1.er tramo
+        return {
+            **asdict(REVENGE),
+            "open":            len(open_rev),
+            "open_symbols":    open_rev,
+            "opened":          self.revenge_counts.get("opened", 0),
+            "blocked":         self.revenge_counts.get("blocked", 0),
+            "last":            dict(self.revenge_last),
+            "first_notional":  first_nt,
+            "first_sl_loss":   first_sl,
+            "first_in_band":   REVENGE.min_loss_usd - 1e-9 <= first_sl <= REVENGE.max_loss_usd + 1e-9,
+        }
+
+    def set_revenge(self, data: dict) -> dict:
+        """Cambia (validando) los ajustes de la venganza y los guarda. Un SL nuevo se
+        aplica también a las venganzas abiertas (salvo SL fijado a mano).
+        ValueError si algún valor es inválido (en ese caso no se aplica nada)."""
+        if not isinstance(data, dict):
+            raise ValueError("Cuerpo JSON inválido")
+        before = asdict(REVENGE)
+        changed = _apply_revenge_dict(data, strict=True)
+        if not changed:
+            raise ValueError("No se recibió ningún ajuste de la venganza reconocido")
+        updated: List[str] = []
+        if "sl_usd" in changed:
+            with self.lock:
+                for sym, p in self.positions.items():
+                    if p.status == "OPEN" and p.fills and p.revenge:
+                        p.revenge_sl_usd = REVENGE.sl_usd
+                        old = p.sl_usd
+                        p.refresh_auto_sl()
+                        if p.sl_usd != old:
+                            updated.append(sym)
+        err = _save_settings()
+        if err:
+            self.log(f"No pude guardar ajustes: {err}")
+        diffs = [f"{k}: {before[k]} → {v}" for k, v in changed.items() if before.get(k) != v]
+        r = REVENGE
+        self.log(f"⚔️ VENGANZA {'activada' if r.enabled else 'desactivada'}: SL de "
+                 f"−{r.min_loss_usd:g} a −{r.max_loss_usd:g} USD → posición contraria con "
+                 f"{r.notional_mult:g}× el notional, TP = la pérdida, SL {r.sl_usd:g} USD"
+                 + (f" ({', '.join(diffs)})" if diffs else " (sin cambios)")
+                 + (f" | SL aplicado a las venganzas abiertas: {', '.join(sorted(updated))}" if updated else ""))
+        self.persist_state()
+        for sym in self._open_position_symbols():
+            self._enqueue(sym)
+        return {"revenge": self.revenge_view(), "updated": sorted(updated)}
 
     # ── Estadísticas MFE / MAE ────────────────────────────────────────────────
 
@@ -4093,7 +4455,8 @@ class TradingBot:
                 pause = " · entradas EN PAUSA " + self._pause_left_txt(RISK.pause_until)
             parts.append(f"ajustes (EMA {EMA_FAST}/{EMA_SLOW} · SL {DEFAULT_STOP_LOSS_USD:g} USD · "
                          f"TP {TAKE_PROFIT_FRACTION * 100:g}% · DCA {len(ENTRY_LADDER)} tramos · modo "
-                         f"{'invertido' if MODE.inverted else 'normal'}{pause})")
+                         f"{'invertido' if MODE.inverted else 'normal'} · venganza "
+                         f"{'activa' if REVENGE.enabled else 'apagada'}{pause})")
 
         # 2) Posiciones abiertas, cooldowns, PnL realizado y contadores
         now = time.time()
@@ -4139,7 +4502,8 @@ class TradingBot:
                 key=lambda c: (_num(c.get("closed_ts")), str(c.get("closed_at") or "")),
                 reverse=True)[:500]
             n_open = sum(1 for p in self.positions.values() if p.status == "OPEN" and p.fills)
-            pos_txt = ", ".join(f"{p.symbol} {p.direction}{' inv.' if p.inverted else ''} "
+            pos_txt = ", ".join(f"{p.symbol} {p.direction}{' inv.' if p.inverted else ''}"
+                                f"{f' venganza de #{p.revenge_of}' if p.revenge else ''} "
                                 f"{len(p.fills)} tramo{'s' if len(p.fills) != 1 else ''}"
                                 for p in list(self.positions.values())[:6])
             n_closed = len(self.closed_trades)
@@ -4368,8 +4732,9 @@ class TradingBot:
             ("MANUAL",    [r for r in recs if r.get("reason") == "MANUAL"]),
             ("GLOBAL",    [r for r in recs if r.get("reason") == "GLOBAL"]),
             ("GLOBAL_TP", [r for r in recs if r.get("reason") == "GLOBAL_TP"]),
-            ("NORMAL",    [r for r in recs if not r.get("inverted")]),
-            ("INVERTED",  [r for r in recs if r.get("inverted")]),
+            ("NORMAL",    [r for r in recs if not r.get("inverted") and not r.get("revenge")]),
+            ("INVERTED",  [r for r in recs if r.get("inverted") and not r.get("revenge")]),
+            ("REVENGE",   [r for r in recs if r.get("revenge")]),
         ):
             groups[name] = {
                 "n":          len(subset),
@@ -4384,9 +4749,10 @@ class TradingBot:
         total_pnl = sum(float(r.get("pnl", 0)) for r in recs)
 
         # ¿Qué SL habría cortado ganadoras (TP)? (MAE <= SL → la operación se habría parado)
-        # Solo posiciones normales: en las invertidas el importe fijo es el TP.
+        # Solo posiciones normales: en las invertidas el importe fijo es el TP y las
+        # venganzas tienen su propio SL fijo.
         tp_mae = [float(r.get("mae_usd", 0)) for r in recs
-                  if r.get("reason") == "TP" and not r.get("inverted")]
+                  if r.get("reason") == "TP" and not r.get("inverted") and not r.get("revenge")]
         tps_normal = len(tp_mae)
         sl_sim = []
         for sl in (-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -8.0, -10.0, -12.0, -15.0, -20.0):
@@ -4395,6 +4761,18 @@ class TradingBot:
                 "sl": sl, "tp_stopped": stopped, "tp_total": tps_normal,
                 "pct": (stopped / tps_normal * 100.0) if tps_normal else 0.0,
             })
+        # Venganzas: cuántas recuperaron la pérdida (TP) y el neto de cada pareja
+        # (pérdida de la original + resultado de la venganza)
+        revs = [r for r in recs if r.get("revenge")]
+        revenge = {
+            "n":    len(revs),
+            "tp":   sum(1 for r in revs if r.get("reason") == "TP"),
+            "sl":   sum(1 for r in revs if r.get("reason") == "SL"),
+            "pnl":  sum(_num(r.get("pnl")) for r in revs),
+            "lost": sum(_num(r.get("revenge_loss")) for r in revs),
+            "net":  sum(_num(r.get("revenge_net"), _num(r.get("pnl")) + _num(r.get("revenge_loss")))
+                        for r in revs),
+        }
         return {
             "count":     len(recs),
             "win_rate":  (tps / len(recs) * 100.0) if recs else 0.0,
@@ -4402,6 +4780,7 @@ class TradingBot:
             "avg_pnl":   (total_pnl / len(recs)) if recs else 0.0,
             "groups":    groups,
             "sl_sim":    sl_sim,
+            "revenge":   revenge,
             "updated":   time.time(),
         }
 
@@ -4437,8 +4816,9 @@ class TradingBot:
         return {"default_stop_loss_usd": DEFAULT_STOP_LOSS_USD, "updated": updated}
 
     def set_stop_loss(self, symbol: str, sl_usd: float) -> bool:
-        """Fija un stop loss MANUAL (USD, negativo) para una posición NORMAL abierta.
-        Queda marcado como manual: el SL automático por tramos ya no lo pisa.
+        """Fija un stop loss MANUAL (USD, negativo) para una posición NORMAL (o un
+        trade de venganza) abierta. Queda marcado como manual: el SL automático por
+        tramos ya no lo pisa.
         ValueError si la posición es invertida (en ella lo editable es el TP)."""
         symbol = symbol.upper().strip()
         with self.lock:
@@ -4450,7 +4830,8 @@ class TradingBot:
                                  f"su take profit (POST /api/set-tp/{symbol})")
             pos.sl_usd    = sl_usd
             pos.sl_manual = True
-        self.log(f"Stop loss MANUAL para {symbol}: {sl_usd:.4f} USD")
+            kind = f" (venganza de #{pos.revenge_of})" if pos.revenge else ""
+        self.log(f"Stop loss MANUAL para {symbol}{kind}: {sl_usd:.4f} USD")
         self.persist_state()
         # Reevalúa ya con el nuevo SL (por si el precio actual ya lo cruza)
         self._enqueue(symbol)
@@ -4458,19 +4839,25 @@ class TradingBot:
 
     def set_take_profit_manual(self, symbol: str, tp_usd: float) -> bool:
         """Fija un take profit MANUAL (USD, positivo) para una posición INVERTIDA
-        abierta (el espejo del SL manual de una normal: el bot ya no lo cambia).
+        abierta (el espejo del SL manual de una normal: el bot ya no lo cambia) o
+        para un trade de VENGANZA (sustituye a la pérdida que buscaba recuperar).
         ValueError si la posición es normal."""
         symbol = symbol.upper().strip()
         with self.lock:
             pos = self.positions.get(symbol)
             if not pos or pos.status != "OPEN":
                 return False
-            if not pos.inverted:
+            if pos.revenge:
+                pos.revenge_tp_usd = abs(float(tp_usd))
+                kind = f"venganza de #{pos.revenge_of}"
+            elif not pos.inverted:
                 raise ValueError(f"{symbol} es una posición normal: su take profit es notional × "
                                  f"multiplicador; lo que se edita a mano es su stop loss")
-            pos.sl_usd    = -abs(float(tp_usd))      # se guarda en espejo (TP = −sl_usd)
-            pos.sl_manual = True
-        self.log(f"Take profit MANUAL para {symbol} (invertida): {abs(tp_usd):+.4f} USD")
+            else:
+                pos.sl_usd    = -abs(float(tp_usd))      # se guarda en espejo (TP = −sl_usd)
+                pos.sl_manual = True
+                kind = "invertida"
+        self.log(f"Take profit MANUAL para {symbol} ({kind}): {abs(tp_usd):+.4f} USD")
         self.persist_state()
         self._enqueue(symbol)                    # por si el precio actual ya lo alcanza
         return True
@@ -4754,7 +5141,8 @@ class TradingBot:
             self.log(f"No pude guardar ajustes: {err}")
         with self.lock:
             others = sorted(sym for sym, p in self.positions.items()
-                            if p.status == "OPEN" and p.fills and p.inverted != enabled)
+                            if p.status == "OPEN" and p.fills and p.inverted != enabled
+                            and not p.revenge)
         if changed:
             r = self.mirror_rules()
             keep = ""
@@ -5278,17 +5666,19 @@ class TradingBot:
             sig_dir = pos.signal_dir             # la condición EMA mira la señal (espejo)
             if ema_val is not None and price > 0:
                 ema_ok = price > ema_val if sig_dir == "LONG" else price < ema_val
+            has_dca = nxt < len(ladder) and not pos.revenge      # la venganza no hace DCA
             dca_next = {
                 "idx":         nxt,
-                "level":       ladder[nxt][0] if nxt < len(ladder) else None,
-                "notional":    ladder[nxt][1] if nxt < len(ladder) else None,
+                "level":       ladder[nxt][0] if has_dca else None,
+                "notional":    ladder[nxt][1] if has_dca else None,
                 # % que manda en el DCA: en contra (normal) o a favor (invertida)
                 "adverse":     pos.trigger_pct(price),
                 "ema_dir":     sig_dir,
                 "ema_period":  RISK.dca_ema_period,
                 "ema":         ema_val,
-                "ema_applies": ema_applies,
+                "ema_applies": ema_applies and has_dca,
                 "ema_ok":      ema_ok,
+                "revenge":     pos.revenge,
             }
             open_positions.append({
                 "symbol":          symbol,
@@ -5298,6 +5688,11 @@ class TradingBot:
                 "qty":             pos.qty,
                 "notional":        pos.notional,
                 "inverted":        pos.inverted,
+                # Trade de venganza: bandera, trade que venga y la pérdida que busca recuperar
+                "revenge":         pos.revenge,
+                "revenge_of":      pos.revenge_of,
+                "revenge_loss":    pos.revenge_loss,
+                "revenge_tp_manual": pos.revenge_tp_manual,
                 "signal_dir":      pos.signal_dir,
                 "target":          pos.exit_tp(),        # TP real (USD)
                 "take_profit_price": pos.tp_price(),
@@ -5391,6 +5786,7 @@ class TradingBot:
             "inverted_mode":     MODE.inverted,
             "inverted_since":    MODE.changed_at,
             "mirror_rules":      self.mirror_rules(),
+            "revenge":           self.revenge_view(),
             "rest_proxy":        REST_ROUTER.view(),
             "positions":         open_positions,
             "winners":           winners_out,
@@ -5617,6 +6013,7 @@ HTML = r"""<!doctype html>
       --ok: #3dd68c; --warn: #f2b33d; --bad: #f0605d; --off: #4a5468;
       --long: #3dd68c; --short: #f07c5d;
       --inv: #b48cff;
+      --rev: #ff7ab8;
       --r-lg: 12px; --r-md: 8px; --r-sm: 6px;
       --font: "Barlow", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       --font-c: "Barlow Semi Condensed", "Barlow", system-ui, sans-serif;
@@ -5863,6 +6260,12 @@ HTML = r"""<!doctype html>
     .side.inv { box-shadow: inset 0 0 0 1.5px var(--inv); }
     .inv-tag { font-family: var(--font-c); font-weight: 700; font-size: 11px; color: var(--inv); border: 1px solid rgba(180,140,255,.5); border-radius: 4px; padding: 0 4px; margin-left: 6px; vertical-align: 1px; }
     .ctl.inv-on { background: linear-gradient(180deg, rgba(180,140,255,.09), rgba(180,140,255,0) 75%); }
+    /* Trade de venganza (bandera propia, como la de las invertidas) */
+    .rev-tag { display: inline-block; font-family: var(--font-c); font-weight: 700; font-size: 11px; letter-spacing: .3px; color: var(--rev); border: 1px solid rgba(255,122,184,.55); background: rgba(255,122,184,.08); border-radius: 4px; padding: 0 4px; margin-left: 6px; vertical-align: 1px; }
+    .side.rev { box-shadow: inset 0 0 0 1.5px var(--rev); }
+    .rev-note { display: block; margin-top: 2px; font-size: 12px; color: var(--muted); font-weight: 500; }
+    .rev-note b { font-family: var(--font-c); font-weight: 600; }
+    .log li.rev { color: #ffc2de; }
     .inv-map { list-style: none; margin: 0; padding: 0; border: 1px solid var(--rule); border-radius: var(--r-md); font-size: 13.5px; }
     .inv-map li { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; padding: 7px 12px; border-bottom: 1px solid var(--rule); }
     .inv-map li:last-child { border-bottom: 0; }
@@ -6218,6 +6621,25 @@ HTML = r"""<!doctype html>
           </div>
         </details>
 
+        <details class="acc" id="cfg-rev">
+          <summary><span class="acc-name">Trade de venganza</span><span class="acc-val" id="cvRev">—</span><span class="chev"></span></summary>
+          <div class="acc-body" data-panel>
+            <p class="hint">Cuando una operación cierra por su stop loss con una pérdida dentro de este rango, el bot abre al momento la posición contraria en el mismo símbolo con el notional multiplicado. Su take profit es la pérdida de la original (busca recuperarla) y su stop loss es fijo. No hace DCA y, si pierde, no se venga otra vez. Pasa por la pausa, la exposición y los filtros BTC como cualquier entrada nueva.</p>
+            <label class="switch"><input type="checkbox" id="rvEnabled"><span class="track"></span>Venganza activada</label>
+            <div class="field-row">
+              <div class="field"><label for="rvMin">Pérdida mínima (USD)</label><input id="rvMin" type="number" step="0.1" min="0.01" inputmode="decimal" placeholder="1"></div>
+              <div class="field"><label for="rvMax">Pérdida máxima (USD)</label><input id="rvMax" type="number" step="0.1" min="0.01" inputmode="decimal" placeholder="2"></div>
+            </div>
+            <div class="field-row">
+              <div class="field"><label for="rvMult">Notional (× el de la original)</label><input id="rvMult" type="number" step="0.5" min="0.1" max="20" inputmode="decimal" placeholder="2"></div>
+              <div class="field"><label for="rvSl">Stop loss de la venganza (USD)</label><input id="rvSl" type="number" step="0.5" placeholder="-8"></div>
+            </div>
+            <p class="hint" id="rvExplain">—</p>
+            <p class="hint" id="rvStatus"></p>
+            <button class="btn primary" id="rvSave">Guardar venganza</button>
+          </div>
+        </details>
+
         <details class="acc" id="cfg-ema">
           <summary><span class="acc-name">Cruce de EMAs</span><span class="acc-val on" id="cvEma">—</span><span class="chev"></span></summary>
           <div class="acc-body" data-panel>
@@ -6282,6 +6704,7 @@ HTML = r"""<!doctype html>
         <button data-f="GLOBAL" aria-pressed="false">Stop global</button>
         <button data-f="GLOBAL_TP" aria-pressed="false">TP global</button>
         <button data-f="INV" aria-pressed="false">Invertidas</button>
+        <button data-f="REV" aria-pressed="false">Venganza</button>
       </div>
       <div class="tablewrap" style="margin-top:12px; max-height:520px; overflow:auto">
         <table class="rt">
@@ -6302,6 +6725,7 @@ HTML = r"""<!doctype html>
         <div><span>MFE mediana</span><b class="pos" id="stMfe">—</b></div>
         <div><span>MAE mediana</span><b class="neg" id="stMae">—</b></div>
       </div>
+      <p class="muted" id="stRev" hidden style="margin:0;font-size:14px;line-height:1.6"></p>
       <div class="twocol">
         <div>
           <h3 class="sub-h">Por tipo de cierre (USD, MAE en valor absoluto)</h3>
@@ -6678,17 +7102,25 @@ function rangePos(pnl, sl, tp) {
   if (span <= 0) return [0.5, 0.5];
   return [clamp01((n(pnl) - n(sl)) / span), clamp01((0 - n(sl)) / span)];
 }
+// Bandera del trade de venganza (como la "INV" de las invertidas)
+function revTag(origId) {
+  return `<span class="rev-tag" title="Trade de venganza de la operación #${n(origId)}">VENGANZA</span>`;
+}
 function posItem(p) {
-  const sym = p.symbol, side = p.direction === 'LONG' ? 'LONG' : 'SHORT', inv = !!p.inverted;
+  const sym = p.symbol, side = p.direction === 'LONG' ? 'LONG' : 'SHORT', inv = !!p.inverted, rev = !!p.revenge;
   const fills = Array.isArray(p.fills) ? p.fills : [];
   const pnl = n(p.unrealized_pnl);
   const [m, z] = rangePos(pnl, p.stop_loss_usd, p.target);
   const rows = fills.map((f, i) => `<tr><td>${i + 1}</td><td>${fmtN(f.level)} %</td><td>${fx(f.notional, 2)}</td><td>${px(f.entry_price)}</td><td>${f.qty}</td><td>${hhmm(f.opened_at)}</td></tr>`).join('');
   const slPct = n(p.notional) > 0 ? fx(-n(p.stop_loss_usd) / n(p.notional) * 100, 2) : '0';
+  const sideTitle = rev ? ` title="Venganza de #${n(p.revenge_of)}: al revés de la original, que cerró con ${sgn(p.revenge_loss, 3)} USD"`
+                  : inv ? ` title="Invertida: la señal era ${esc(p.signal_dir)}"` : '';
+  const tpNote = rev ? (p.revenge_tp_manual ? ', fijado a mano' : `, recupera ${sgn(p.revenge_loss, 3)} de #${n(p.revenge_of)}`)
+               : inv ? ', ' + esc(p.sl_mode || '') : '';
   return `<details id="prow_${sym}" data-sym="${sym}"${_openPos.has(sym) ? ' open' : ''}>
     <summary>
-      <span class="side ${side.toLowerCase()}${inv ? ' inv' : ''}"${inv ? ` title="Invertida: la señal era ${esc(p.signal_dir)}"` : ''}>${side}</span>
-      <span class="pos-id"><b>${sym}${inv ? '<span class="inv-tag">INV</span>' : ''}</b><small>${fills.length} tramo${fills.length === 1 ? '' : 's'}, ${fx(p.notional, 2)} USDT${inv ? `, señal ${esc(p.signal_dir)}` : ''}${p.exec_url ? '' : ', solo bot'}</small></span>
+      <span class="side ${side.toLowerCase()}${inv ? ' inv' : ''}${rev ? ' rev' : ''}"${sideTitle}>${side}</span>
+      <span class="pos-id"><b>${sym}${inv ? '<span class="inv-tag">INV</span>' : ''}${rev ? revTag(p.revenge_of) : ''}</b><small>${rev ? `venganza de #${n(p.revenge_of)}, ` : ''}${fills.length} tramo${fills.length === 1 ? '' : 's'}, ${fx(p.notional, 2)} USDT${inv ? `, señal ${esc(p.signal_dir)}` : ''}${p.exec_url ? '' : ', solo bot'}</small></span>
       <span id="pc_${sym}" class="chg ${cls(p.change)}">${pctS(p.change)}</span>
       <span class="range" title="PnL entre el stop loss (izquierda) y el take profit (derecha)"><i class="zero" style="left:${(z * 100).toFixed(1)}%"></i><i class="mark" id="pm_${sym}" style="left:${(m * 100).toFixed(1)}%"></i></span>
       <span id="ppnl_${sym}" class="pnl ${cls(pnl)}">${sgn(pnl)}</span>
@@ -6699,12 +7131,12 @@ function posItem(p) {
         <div><dt>Entrada media</dt><dd>${px(p.avg_entry)}</dd></div>
         <div><dt>Precio actual</dt><dd id="pp_${sym}">${px(p.mark_price)}</dd></div>
         <div><dt>Cantidad</dt><dd>${p.qty}</dd></div>
-        <div><dt>Take profit</dt><dd><span class="pos">+${fx(p.target, 3)} USD</span> <small>a ${px(p.take_profit_price)}${inv ? ', ' + esc(p.sl_mode || '') : ''}</small></dd></div>
+        <div><dt>Take profit</dt><dd><span class="pos">+${fx(p.target, 3)} USD</span> <small>a ${px(p.take_profit_price)}${tpNote}</small></dd></div>
         <div><dt>Stop loss</dt><dd><span id="psl_${sym}">${px(p.stop_loss_price)}</span> <small>${sgn(p.stop_loss_usd, 3)} USD, ${inv ? `−${slPct} % del notional` : esc(p.sl_mode || '')}</small></dd></div>
         <div><dt>MFE (mejor)</dt><dd id="pmfe_${sym}" class="pos">${sgn(p.mfe_usd)}</dd></div>
         <div><dt>MAE (peor)</dt><dd id="pmae_${sym}" class="neg">${sgn(p.mae_usd)}</dd></div>
         <div><dt>Abierta hace</dt><dd id="pdur_${sym}">${fmtDur(Date.now() / 1000 - n(p.opened_ts))}</dd></div>
-        <div><dt>Trade</dt><dd>#${n(p.trade_id)}</dd></div>
+        <div><dt>Trade</dt><dd>#${n(p.trade_id)}${rev ? ` <small>venganza de #${n(p.revenge_of)}</small>` : ''}</dd></div>
         <div><dt>Executor</dt><dd>${p.exec_url ? esc(p.exec_host) + (p.exec_current ? '' : ' <small>link anterior</small>')
           : '<small>no se envió (link en pausa o sin link)</small>'}</dd></div>
       </dl>
@@ -6714,8 +7146,8 @@ function posItem(p) {
         <tbody>${rows}</tbody>
       </table></div>
       <div class="actions">
-        ${inv ? `<button class="btn" data-act="tp" data-sym="${sym}" data-tp="${n(p.target)}">Editar take profit</button>`
-              : `<button class="btn" data-act="sl" data-sym="${sym}" data-sl="${n(p.stop_loss_usd)}">Editar stop loss</button>`}
+        ${inv || rev ? `<button class="btn" data-act="tp" data-sym="${sym}" data-tp="${n(p.target)}">Editar take profit</button>` : ''}
+        ${!inv ? `<button class="btn" data-act="sl" data-sym="${sym}" data-sl="${n(p.stop_loss_usd)}">Editar stop loss</button>` : ''}
         <a class="btn" href="https://www.binance.com/en/futures/${sym}" target="_blank" rel="noopener">Abrir en Binance</a>
         <button class="btn danger" data-act="close" data-sym="${sym}">Cerrar posición</button>
       </div>
@@ -6725,6 +7157,10 @@ function posItem(p) {
 // Estado del próximo DCA de una posición (y de la condición EMA, si aplica)
 function dcaHtml(p) {
   const d = p.dca_next || {};
+  if (p.revenge || d.revenge) {
+    return `Trade de venganza de la operación <b>#${n(p.revenge_of)}</b>, que cerró por stop loss con <b class="neg">${sgn(p.revenge_loss, 3)} USD</b>: `
+      + `no hace DCA. Cierra en su take profit (<b class="pos">+${fx(p.target, 3)} USD</b>) o en su stop loss (<b class="neg">${sgn(p.stop_loss_usd, 2)} USD</b>), y si pierde no se venga otra vez.`;
+  }
   if (d.level === null || d.level === undefined) return 'Escalera completa: no quedan tramos DCA para esta posición.';
   const inv = !!p.inverted;
   let s = `Próximo DCA: tramo ${n(d.idx) + 1}, <b>${fx(d.notional, 2)} USDT</b> al <b>${fmtN(d.level)} %</b> ${inv ? 'a favor' : 'en contra'} (ahora ${sgn(d.adverse, 2)} %)`
@@ -6743,7 +7179,8 @@ function renderPositions(positions) {
   _posMeta = {};
   positions.forEach(p => { _posMeta[p.symbol] = { opened: n(p.opened_ts) }; });
   const sig = JSON.stringify(positions.map(p => [p.symbol, p.direction, p.avg_entry, p.qty, p.notional, p.target,
-    p.stop_loss_usd, p.sl_mode, (p.fills || []).length, p.exec_url, p.exec_current, p.inverted]));
+    p.stop_loss_usd, p.sl_mode, (p.fills || []).length, p.exec_url, p.exec_current, p.inverted,
+    p.revenge, p.revenge_of, p.revenge_tp_manual]));
   if (sig !== _posSig) {
     _posSig = sig;
     const live = new Set(positions.map(p => p.symbol));
@@ -6766,35 +7203,55 @@ function patchPosition(sym, p) {
 
 // ── Historial ───────────────────────────────────────────────────────────────
 // Un cooldown liberado a mano ya no está activo aunque su hora no haya llegado
-function cdUntilTxt(t) {
+function cdUntilTxt(t, revId) {
+  // La venganza reabre el símbolo al momento: el cooldown de la original no llega a contar
+  if (revId) return `venganza #${revId}`;
   const until = n(t.unblock_ts);
   if (until && until > Date.now() / 1000 + _skew && !((_d && _d.cooldowns) || {})[t.symbol]) return 'liberado a mano';
   return t.unblock_at || '—';
 }
 const REASONS = { TP: ['tp', 'Take profit'], SL: ['sl', 'Stop loss'], MANUAL: ['manual', 'Manual'],
                   GLOBAL: ['global', 'Stop global'], GLOBAL_TP: ['gtp', 'TP global'] };
+const HIST_FILTERS = {
+  ALL: () => true,
+  INV: t => !!t.inverted,
+  REV: t => !!t.revenge,
+};
+const HIST_EMPTY = { INV: 'Ninguna posición invertida cerrada.', REV: 'Ningún trade de venganza cerrado todavía.' };
 function renderHistory() {
   const closed = (_d && Array.isArray(_d.closed_trades)) ? _d.closed_trades : [];
-  const rows = closed.filter(t => _histFilter === 'ALL' || (_histFilter === 'INV' ? !!t.inverted : t.reason === _histFilter));
+  // Operación original → trade de venganza que abrió (cerrado o todavía abierto)
+  const revBy = {};
+  closed.forEach(t => { if (t.revenge && n(t.revenge_of)) revBy[n(t.revenge_of)] = n(t.trade_id); });
+  ((_d && _d.positions) || []).forEach(p => { if (p.revenge && n(p.revenge_of)) revBy[n(p.revenge_of)] = n(p.trade_id); });
+  const keep = HIST_FILTERS[_histFilter] || (t => t.reason === _histFilter);
+  const rows = closed.filter(keep);
   const html = rows.length ? rows.map(t => {
     const r = REASONS[t.reason] || ['', t.reason || '—'];
+    const revId = !t.revenge && n(t.trade_id) ? revBy[n(t.trade_id)] : 0;
+    const net = n(t.revenge_net !== undefined ? t.revenge_net : n(t.pnl) + n(t.revenge_loss));
+    const note = t.revenge
+      ? `<small class="rev-note">de #${n(t.revenge_of)} (${sgn(t.revenge_loss, 2)}), neto <b class="${cls(net)}">${sgn(net, 2)}</b></small>`
+      : revId ? `<small class="rev-note">⚔ vengada en #${revId}</small>` : '';
     return `<tr>
       <td data-label="Símbolo" class="sym">${esc(t.symbol)}</td>
-      <td data-label="Lado"><span>${esc(t.direction || '—')}${t.inverted ? '<span class="inv-tag" title="Posición invertida">INV</span>' : ''}</span></td>
-      <td data-label="Motivo"><span class="tag ${r[0]}">${esc(r[1])}</span></td>
+      <td data-label="Lado"><span>${esc(t.direction || '—')}${t.inverted ? '<span class="inv-tag" title="Posición invertida">INV</span>' : ''}${t.revenge ? revTag(t.revenge_of) : ''}</span></td>
+      <td data-label="Motivo"><span><span class="tag ${r[0]}">${esc(r[1])}</span>${note}</span></td>
       <td data-label="PnL" class="num ${cls(t.pnl)}">${sgn(t.pnl)}</td>
       <td data-label="MFE" class="pos">${t.mfe_usd === undefined ? '—' : sgn(t.mfe_usd)}</td>
       <td data-label="MAE" class="neg">${t.mae_usd === undefined ? '—' : sgn(t.mae_usd)}</td>
       <td data-label="Duración">${t.duration_s === undefined ? '—' : fmtDur(t.duration_s)}</td>
       <td data-label="Entrada">${px(t.avg_entry)}</td>
       <td data-label="Cierre">${px(t.close_price)}</td>
-      <td data-label="Cooldown hasta" class="muted">${esc(cdUntilTxt(t))}</td>
+      <td data-label="Cooldown hasta" class="muted">${esc(cdUntilTxt(t, revId))}</td>
       <td data-label="Cerrada" class="muted">${esc(t.closed_at || '')}</td>
     </tr>`;
-  }).join('') : `<tr><td colspan="11" class="muted">${!closed.length ? 'Todavía no hay cierres.' : _histFilter === 'INV' ? 'Ninguna posición invertida cerrada.' : 'Ningún cierre con ese motivo.'}</td></tr>`;
+  }).join('') : `<tr><td colspan="11" class="muted">${!closed.length ? 'Todavía no hay cierres.' : HIST_EMPTY[_histFilter] || 'Ningún cierre con ese motivo.'}</td></tr>`;
   setHTML(q('tbClosed'), html);
   const rp = n(_d && _d.total_realized_pnl);
-  setHTML(q('histSum'), closed.length ? `${closed.length} cierres, realizado <b class="${cls(rp)}">${sgn(rp)} USDT</b>` : 'Sin cierres');
+  const nRev = closed.filter(t => t.revenge).length;
+  setHTML(q('histSum'), closed.length ? `${closed.length} cierres, realizado <b class="${cls(rp)}">${sgn(rp)} USDT</b>`
+    + (nRev ? `, ${nRev} de venganza` : '') : 'Sin cierres');
 }
 
 // ── Memoria Upstash (aviso, diagnóstico y texto de Ajustes) ─────────────────
@@ -6922,6 +7379,7 @@ function render(d) {
   // Modo invertido (tarjeta, insignia y rótulos de los ajustes en espejo)
   renderMode(!!d.inverted_mode, d.mirror_rules, d.gate || {});
   const inv = !!d.inverted_mode;
+  renderRevenge(d.revenge);
 
   // Ajustes: SL, TP, EMA, DCA (en modo invertido se muestran en espejo: mismo valor, otro signo)
   const frac = n(d.first_tranche_sl_fraction || 0.251), defSl = n(d.default_stop_loss_usd ?? -8);
@@ -6951,12 +7409,14 @@ function render(d) {
   // Señales frenadas
   const g = d.gate || {};
   const KIND = { pausa: 'Pausa', exposicion: 'Exposición', btc: 'Filtro BTC', btc_down: 'Filtro BTC bajista',
-                 btc_up: 'Filtro BTC alcista', ema_dca: 'Condición EMA', memoria: 'Memoria Upstash' };
+                 btc_up: 'Filtro BTC alcista', ema_dca: 'Condición EMA', memoria: 'Memoria Upstash',
+                 cierre: 'Cierre masivo', precio: 'Falta de precio' };
+  const WHAT = { DCA: 'un DCA', venganza: 'la venganza' };
   const recent = Array.isArray(g.blocked_recent) ? g.blocked_recent : [];
   setHTML(q('blkList'), recent.length ? recent.map(b => `<li>
-      <time>${hhmm(b.ts)}</time><span class="side ${b.side === 'LONG' ? 'long' : 'short'}">${esc(b.side)}</span>
-      <b>${esc(b.symbol)}</b>
-      <span class="why">${esc(KIND[b.kind] || b.kind)} frenó ${b.what === 'DCA' ? 'un DCA' : 'la entrada'}${b.extra ? ' (' + esc(b.extra) + ')' : ''}: ${esc(b.detail)}</span>
+      <time>${hhmm(b.ts)}</time><span class="side ${b.side === 'LONG' ? 'long' : 'short'}${b.what === 'venganza' ? ' rev' : ''}">${esc(b.side)}</span>
+      <b>${esc(b.symbol)}${b.what === 'venganza' ? '<span class="rev-tag">VENGANZA</span>' : ''}</b>
+      <span class="why">${esc(KIND[b.kind] || b.kind)} frenó ${WHAT[b.what] || 'la entrada'}${b.extra ? ' (' + esc(b.extra) + ')' : ''}: ${esc(b.detail)}</span>
     </li>`).join('') : '<li class="muted" style="display:block">Ninguna señal frenada desde el arranque.</li>');
   const counts = g.blocked_counts || {};
   const parts = Object.keys(counts).map(k => `${KIND[k] || k}: ${counts[k]}`);
@@ -7015,7 +7475,8 @@ function render(d) {
     const text = i > 0 ? line.slice(i + 3) : line;
     const k = /STOP GLOBAL|STOP LOSS|Error|error|falló|⛔|🛑/.test(text) ? 'bad'
       : /CIERRE TP|REANUDAD|vuelve a responder|TP GLOBAL/.test(text) ? 'good'
-      : /PAUSA|frenada|⚠️|CIERRE MASIVO|LINK CAMBIADO|MODO INVERTIDO|MODO NORMAL|bloquead|limitad|fuera (durante|hasta)|\(407:/.test(text) ? 'warn' : '';
+      : /PAUSA|frenada|⚠️|CIERRE MASIVO|LINK CAMBIADO|MODO INVERTIDO|MODO NORMAL|bloquead|limitad|fuera (durante|hasta)|\(407:/.test(text) ? 'warn'
+      : /VENGANZA/.test(text) ? 'rev' : '';
     return `<li class="${k}"><time>${esc(stamp)}</time><span>${esc(text)}</span></li>`;
   }).join(''));
 
@@ -7060,10 +7521,20 @@ function renderStats(s) {
   setTxt('stMae', all && all.n ? '−' + fx(all.mae_usd.median, 3) : '—');
   setTxt('statsSum', s.count ? `${n(s.count)} operaciones, acierto ${fx(s.win_rate, 1)} %, PnL total ${sgn(s.total_pnl)}` : 'Mejor y peor PnL alcanzado por cada operación');
   const names = { ALL: 'Todas', TP: 'Take profit', SL: 'Stop loss', MANUAL: 'Manual', GLOBAL: 'Stop global',
-                  GLOBAL_TP: 'TP global', NORMAL: 'Normales', INVERTED: 'Invertidas' };
-  const G = s.groups || {}, hasInv = !!(G.INVERTED && G.INVERTED.n);
-  const keys = ['ALL', 'TP', 'SL', 'MANUAL', 'GLOBAL', 'GLOBAL_TP'].concat(hasInv ? ['NORMAL', 'INVERTED'] : []);
-  setTxt('slSimTitle', 'Take profits que cada SL habría cortado' + (hasInv ? ' (solo posiciones normales)' : ''));
+                  GLOBAL_TP: 'TP global', NORMAL: 'Normales', INVERTED: 'Invertidas', REVENGE: 'Venganza' };
+  const G = s.groups || {}, hasInv = !!(G.INVERTED && G.INVERTED.n), hasRev = !!(G.REVENGE && G.REVENGE.n);
+  const keys = ['ALL', 'TP', 'SL', 'MANUAL', 'GLOBAL', 'GLOBAL_TP'].concat(hasInv || hasRev ? ['NORMAL'] : [])
+    .concat(hasInv ? ['INVERTED'] : []).concat(hasRev ? ['REVENGE'] : []);
+  setTxt('slSimTitle', 'Take profits que cada SL habría cortado' + (hasInv || hasRev ? ' (solo posiciones normales)' : ''));
+  // Resumen de las venganzas: cuántas recuperaron la pérdida y el neto de cada pareja
+  const rv = s.revenge || {}, nr = n(rv.n), other = nr - n(rv.tp) - n(rv.sl);
+  setHTML(q('stRev'), nr
+    ? `<span class="rev-tag" style="margin:0 6px 0 0">VENGANZA</span>${nr} trade${nr === 1 ? '' : 's'}: `
+      + `${n(rv.tp)} ${n(rv.tp) === 1 ? 'recuperó' : 'recuperaron'} la pérdida (TP), ${n(rv.sl)} ${n(rv.sl) === 1 ? 'cerró' : 'cerraron'} en su stop loss`
+      + (other > 0 ? ` y ${other} por otro motivo (manual o stop global)` : '')
+      + `. Las venganzas suman <b class="${cls(rv.pnl)}">${sgn(rv.pnl, 2)}</b> USD frente a <b class="neg">${sgn(rv.lost, 2)}</b> USD que perdieron sus originales: neto de las parejas <b class="${cls(rv.net)}">${sgn(rv.net, 2)}</b> USD.`
+    : '');
+  q('stRev').hidden = !nr;
   const rows = keys.filter(k => G[k] && G[k].n).map(k => {
     const g = G[k], tot = n(g.pnl && g.pnl.mean) * n(g.n);
     return `<tr><td>${names[k]}</td><td>${g.n}</td><td class="num ${cls(tot)}">${sgn(tot, 2)}</td>
@@ -7486,6 +7957,62 @@ async function saveTp() {
   } catch (e) { toast('No se guardó: ' + e.message, 'bad'); }
   finally { busy(btn, false); }
 }
+
+// ── Trade de venganza ───────────────────────────────────────────────────────
+let _rev = null;
+function renderRevenge(rv) {
+  if (!rv) return;
+  _rev = rv;
+  const on = !!rv.enabled;
+  setTxt('cvRev', on ? `−${fmtN(rv.min_loss_usd, 2)} a −${fmtN(rv.max_loss_usd, 2)} USD, ${fmtN(rv.notional_mult, 2)}×, SL −${fmtN(Math.abs(n(rv.sl_usd)), 2)}` : 'Apagado');
+  q('cvRev').classList.toggle('on', on);
+  fillChk('rvEnabled', on);
+  fillVal('rvMin', fmtN(rv.min_loss_usd, 2)); fillVal('rvMax', fmtN(rv.max_loss_usd, 2));
+  fillVal('rvMult', fmtN(rv.notional_mult, 2)); fillVal('rvSl', fmtN(rv.sl_usd, 2));
+  revExplain();
+  const k = n(rv.open), op = n(rv.opened), bl = n(rv.blocked), last = rv.last || {};
+  let st = (k ? `${k} abierta${k === 1 ? '' : 's'} ahora (${(rv.open_symbols || []).join(', ')}). ` : 'Ninguna abierta ahora. ')
+    + `Desde el arranque: ${op} abierta${op === 1 ? '' : 's'} y ${bl} frenada${bl === 1 ? '' : 's'}.`;
+  if (last.symbol) {
+    st += ` La última, ${last.side} ${last.symbol} a las ${hhmm(last.ts)} (de #${n(last.orig_trade_id)}): `
+      + (last.ok ? 'abierta.' : `no se abrió, ${last.detail || 'frenada'}.`);
+  }
+  setTxt('rvStatus', st);
+}
+function revExplain() {
+  const rv = _rev || {}, on = q('rvEnabled').checked;
+  const lo = Math.abs(numVal('rvMin')), hi = Math.abs(numVal('rvMax')), mult = numVal('rvMult'), sl = negVal('rvSl');
+  if (!(lo > 0) || !(hi > 0) || !(mult > 0) || isNaN(sl)) { setTxt('rvExplain', 'Escribe el rango de pérdida, el multiplicador y el stop loss.'); return; }
+  if (lo > hi) { setTxt('rvExplain', 'La pérdida mínima no puede ser mayor que la máxima.'); return; }
+  const frac = n(_d && _d.first_tranche_sl_fraction) || 0.251;
+  const nt = n(rv.first_notional) || 5, loss = n(rv.first_sl_loss) || nt * frac;
+  const inBand = loss >= lo - 1e-9 && loss <= hi + 1e-9;
+  let s = (on ? 'Se vengan' : 'Apagada. Al activarla se vengarían') + ` los stop loss de −${fx(lo, 2)} a −${fx(hi, 2)} USD. `;
+  s += inBand
+    ? `Ejemplo con tu escalera: un LONG de ${fmtN(nt)} USDT que cierra por su stop loss en −${fx(loss, 3)} USD abre al momento un SHORT de ${fmtN(nt * mult)} USDT con TP +${fx(loss, 3)} USD y SL ${sgn(sl, 2)} USD.`
+    : `Ojo: el stop loss del primer tramo (${fmtN(nt)} USDT × ${fmtN(frac)} = −${fx(loss, 3)} USD) queda fuera de este rango, así que esas pérdidas no se vengarían.`;
+  const g = _gate || {};
+  if (g.gstop_enabled && n(g.gstop_usd) > sl) s += ` El stop global (${fx(g.gstop_usd, 2)} USD) también cuenta las venganzas y puede cerrarlas antes de su stop loss.`;
+  setTxt('rvExplain', s);
+}
+async function saveRevenge() {
+  const lo = Math.abs(numVal('rvMin')), hi = Math.abs(numVal('rvMax')), mult = numVal('rvMult'), sl = negVal('rvSl');
+  if (!(lo >= 0.01) || !(hi >= 0.01)) { toast('Escribe la pérdida mínima y la máxima en USD, por ejemplo 1 y 2.', 'bad'); return; }
+  if (lo > hi) { toast('La pérdida mínima no puede ser mayor que la máxima.', 'bad'); return; }
+  if (!(mult >= 0.1 && mult <= 20)) { toast('El multiplicador del notional va de 0.1 a 20, por ejemplo 2.', 'bad'); return; }
+  if (isNaN(sl)) { toast('Escribe el stop loss de la venganza en USD, por ejemplo -8.', 'bad'); return; }
+  const on = q('rvEnabled').checked, btn = q('rvSave');
+  busy(btn, true);
+  try {
+    const data = await postJSON('/api/set-revenge', { enabled: on, min_loss_usd: lo, max_loss_usd: hi, notional_mult: mult, sl_usd: sl });
+    clearDirty(btn.closest('[data-panel]'));
+    if (data.revenge) renderRevenge(data.revenge);
+    toast(on ? `Venganza activa: stop loss de −${fx(lo, 2)} a −${fx(hi, 2)} USD → ${fmtN(mult)}× al revés, SL ${sgn(sl, 2)} USD`
+             : 'Venganza desactivada', 'ok');
+    requestFull(true);
+  } catch (e) { toast('No se guardó: ' + e.message, 'bad'); }
+  finally { busy(btn, false); }
+}
 async function saveEma() {
   const f = parseInt(q('emaFastInput').value, 10), s = parseInt(q('emaSlowInput').value, 10), btn = q('emaSave');
   if (isNaN(f) || isNaN(s)) { toast('Escribe un número entero en cada EMA.', 'bad'); return; }
@@ -7679,6 +8206,8 @@ document.addEventListener('DOMContentLoaded', () => {
   q('ladReset').addEventListener('click', ladderReset);
   q('gslSave').addEventListener('click', saveGlobalSl);
   q('tpSave').addEventListener('click', saveTp);
+  q('rvSave').addEventListener('click', saveRevenge);
+  ['rvEnabled', 'rvMin', 'rvMax', 'rvMult', 'rvSl'].forEach(id => ['input', 'change'].forEach(ev => q(id).addEventListener(ev, revExplain)));
   q('emaSave').addEventListener('click', saveEma);
   q('pauseBtn').addEventListener('click', togglePause);
   q('invBtn').addEventListener('click', toggleInvert);
@@ -7942,8 +8471,9 @@ def api_set_sl(symbol: str):
 
 @app.post("/api/set-tp/<symbol>")
 def api_set_tp(symbol: str):
-    """Take profit MANUAL (USD, positivo) de una posición INVERTIDA abierta:
-    {"tp_usd": 8}. Es el espejo del SL manual de una posición normal."""
+    """Take profit MANUAL (USD, positivo) de una posición INVERTIDA o de un trade
+    de VENGANZA abierto: {"tp_usd": 8}. En una invertida es el espejo del SL manual
+    de una posición normal; en una venganza sustituye a la pérdida a recuperar."""
     symbol = symbol.upper().strip()
     data = request.get_json(silent=True) or {}
     try:
@@ -7971,6 +8501,29 @@ def api_invert():
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, **bot.set_inverted(enabled)})
+
+
+@app.get("/api/revenge")
+def api_revenge():
+    """Ajustes y estado del trade de venganza."""
+    resp = jsonify(bot.revenge_view())
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.post("/api/set-revenge")
+def api_set_revenge():
+    """Trade de venganza. Cuerpo JSON parcial, p. ej.:
+    {"enabled": true, "min_loss_usd": 1, "max_loss_usd": 2, "notional_mult": 2, "sl_usd": -8}
+    Una operación que cierra por su SL con una pérdida entre min_loss_usd y
+    max_loss_usd abre la posición contraria con notional_mult × su notional,
+    TP = esa pérdida y SL = sl_usd."""
+    data = request.get_json(silent=True)
+    try:
+        result = bot.set_revenge(data or {})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
 
 
 @app.post("/api/force-close/<symbol>")
@@ -8032,7 +8585,8 @@ def api_trades_csv():
     """Descarga CSV de todo el histórico (para analizarlo en Excel / pandas).
     Se lee del archivo línea a línea (en memoria solo están las más recientes)."""
     cols = [
-        "trade_id", "symbol", "direction", "inverted", "signal_dir", "reason", "opened_at_ts", "closed_at_ts",
+        "trade_id", "symbol", "direction", "inverted", "revenge", "revenge_of", "revenge_loss", "revenge_net",
+        "signal_dir", "reason", "opened_at_ts", "closed_at_ts",
         "duration_s", "avg_entry", "close_price", "qty", "notional", "fills_n", "levels",
         "sl_usd", "target", "pnl", "pnl_pct", "mfe_usd", "mae_usd", "mfe_pct", "mae_pct",
         "time_to_mfe_s", "time_to_mae_s", "low_price", "high_price",
