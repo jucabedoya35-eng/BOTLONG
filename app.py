@@ -1301,6 +1301,10 @@ STATS_MAX_IN_MEMORY = max(100, int(os.getenv("STATS_MAX_IN_MEMORY", "3000")))
 #  • Stop global: si el PnL NO realizado total ≤ global_stop_usd → se cierran
 #    TODAS las posiciones (una a una) y, si global_stop_pause, se pausan las
 #    entradas nuevas hasta que las reanudes desde la web.
+#  • TP global: lo mismo hacia arriba: PnL NO realizado total ≥ global_tp_usd →
+#    se cierran todas (una a una) para asegurar la ganancia y, si
+#    global_tp_pause, se pausan las entradas nuevas (con o sin tiempo).
+#    En el libro invertido cada regla va en espejo (stop −X ↔ TP +X).
 #  • Límite de exposición: no se abre una posición nueva si
 #    (notional abierto + notional del nuevo tramo) > max_exposure_usd.
 #    Con exposure_include_dca=True también frena los tramos DCA.
@@ -1336,6 +1340,11 @@ class RiskSettings:
     global_stop_pause:    bool  = _env_bool("GLOBAL_STOP_PAUSE", True)
     # Minutos que dura la pausa del stop global (0 = hasta reanudarla a mano)
     global_stop_pause_min: float = float(os.getenv("GLOBAL_STOP_PAUSE_MIN", "0") or 0)
+    # TP global: PnL no realizado ≥ global_tp_usd (+X) → cierra todas, con su pausa
+    global_tp_enabled:    bool  = _env_bool("GLOBAL_TP_ENABLED", False)
+    global_tp_usd:        float = abs(float(os.getenv("GLOBAL_TP_USD", "5")))
+    global_tp_pause:      bool  = _env_bool("GLOBAL_TP_PAUSE", True)
+    global_tp_pause_min:  float = float(os.getenv("GLOBAL_TP_PAUSE_MIN", "0") or 0)
     exposure_enabled:     bool  = _env_bool("MAX_EXPOSURE_ENABLED", True)
     max_exposure_usd:     float = float(os.getenv("MAX_EXPOSURE_USD", "800"))
     exposure_include_dca: bool  = _env_bool("MAX_EXPOSURE_INCLUDE_DCA", False)
@@ -1382,12 +1391,14 @@ MODE = ModeSettings()
 # pérdida dentro de [min_loss_usd, max_loss_usd] (por defecto de −1 a −2 USD: el
 # SL del 1.er tramo, 5 USDT × 0.251 = −1.255), el bot abre al instante en el mismo
 # símbolo la posición CONTRARIA con notional_mult × el notional con el que cerró:
-#   • TP fijo = la pérdida de la original (busca recuperarla)
+#   • TP ajustable (tp_mode): "loss" → la pérdida de la original × tp_mult
+#     (1 = la recupera justo) · "usd" → una ganancia fija de tp_usd USD
 #   • SL fijo = sl_usd (−8)
 #   • sin DCA, y si la venganza pierde no se venga otra vez (sin cadenas)
-# Pasa por las mismas guardas que una entrada nueva (pausa, exposición, filtros
-# BTC sobre su lado real, memoria Upstash) y queda marcada (revenge) en las
-# posiciones, en el historial, en las estadísticas y en el CSV.
+# El TP y el SL se aplican también a las venganzas abiertas (salvo los fijados a
+# mano en la posición). Pasa por las mismas guardas que una entrada nueva (pausa,
+# exposición, filtros BTC sobre su lado real, memoria Upstash) y queda marcada
+# (revenge) en las posiciones, en el historial, en las estadísticas y en el CSV.
 @dataclass
 class RevengeSettings:
     enabled:       bool  = _env_bool("REVENGE_ENABLED", True)
@@ -1395,9 +1406,22 @@ class RevengeSettings:
     max_loss_usd:  float = float(os.getenv("REVENGE_MAX_LOSS_USD", "2"))     # pérdida hasta (USD, positivo)
     notional_mult: float = float(os.getenv("REVENGE_NOTIONAL_MULT", "2"))    # × el notional de la original
     sl_usd:        float = -abs(float(os.getenv("REVENGE_SL_USD", "-8")))    # SL fijo (USD, negativo)
+    tp_mode:       str   = (os.getenv("REVENGE_TP_MODE", "loss") or "loss").strip().lower()  # loss | usd
+    tp_mult:       float = float(os.getenv("REVENGE_TP_MULT", "1"))          # TP = pérdida × esto
+    tp_usd:        float = abs(float(os.getenv("REVENGE_TP_USD", "2")))      # TP fijo (USD, positivo)
 
 
 REVENGE = RevengeSettings()
+if REVENGE.tp_mode not in ("loss", "usd"):
+    REVENGE.tp_mode = "loss"
+
+
+def _revenge_tp_auto(loss: float) -> float:
+    """TP (USD, positivo) de una venganza según sus ajustes; `loss` = PnL con el
+    que cerró la original (negativo) o su valor absoluto."""
+    if REVENGE.tp_mode == "usd":
+        return abs(REVENGE.tp_usd)
+    return abs(loss) * REVENGE.tp_mult
 # Espera máxima a que el executor reciba el cierre de la original antes de mandarle
 # la apertura de la venganza (si llegan al revés, en modo one-way se netearían).
 REVENGE_EXEC_WAIT_S = float(os.getenv("REVENGE_EXEC_WAIT_S", "12"))
@@ -1445,6 +1469,17 @@ def _v_mode(v: Any) -> str:
     return s
 
 
+def _v_gain_usd(v: Any) -> float:
+    """Ganancia en USD (TP global), siempre positiva: acepta 5, +5 o -5."""
+    try:
+        x = abs(float(str(v).replace(",", ".")))
+    except (TypeError, ValueError):
+        raise ValueError("El TP global debe ser una ganancia en USD (ej. 5)")
+    if x != x or not (0.01 <= x <= 1_000_000):
+        raise ValueError("El TP global va de 0.01 a 1000000 USD")
+    return x
+
+
 RISK_FIELDS = {
     "global_stop_enabled":  _v_bool,
     "global_stop_usd":      _v_float(-1_000_000, -0.01, "El stop global debe ser un número negativo (ej. -5)"),
@@ -1452,6 +1487,12 @@ RISK_FIELDS = {
     "global_stop_pause_min": _v_float(0, PAUSE_MAX_MIN,
                                       f"La pausa tras el stop global va de 0 (hasta reanudarla) "
                                       f"a {PAUSE_MAX_MIN} minutos"),
+    "global_tp_enabled":    _v_bool,
+    "global_tp_usd":        _v_gain_usd,
+    "global_tp_pause":      _v_bool,
+    "global_tp_pause_min":  _v_float(0, PAUSE_MAX_MIN,
+                                     f"La pausa tras el TP global va de 0 (hasta reanudarla) "
+                                     f"a {PAUSE_MAX_MIN} minutos"),
     "exposure_enabled":     _v_bool,
     "max_exposure_usd":     _v_float(1, 100_000_000, "La exposición máxima debe ser un número positivo (ej. 800)"),
     "exposure_include_dca": _v_bool,
@@ -1508,12 +1549,33 @@ def _v_revenge_sl(v: Any) -> float:
     return x
 
 
+def _v_revenge_tp_mode(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if s not in ("loss", "usd"):
+        raise ValueError("El take profit de la venganza es 'loss' (× la pérdida) o 'usd' (fijo en USD)")
+    return s
+
+
+def _v_revenge_tp_usd(v: Any) -> float:
+    """TP fijo de la venganza en USD, siempre positivo: acepta 2 o -2."""
+    try:
+        x = abs(float(str(v).replace(",", ".")))
+    except (TypeError, ValueError):
+        raise ValueError("El take profit fijo de la venganza debe ser un número en USD (ej. 2)")
+    if x != x or not (0.01 <= x <= 100_000):
+        raise ValueError("El take profit fijo de la venganza va de 0.01 a 100000 USD")
+    return x
+
+
 REVENGE_FIELDS = {
     "enabled":       _v_bool,
     "min_loss_usd":  _v_loss_abs,
     "max_loss_usd":  _v_loss_abs,
     "notional_mult": _v_float(0.1, 20, "El multiplicador del notional de la venganza va de 0.1 a 20 (ej. 2)"),
     "sl_usd":        _v_revenge_sl,
+    "tp_mode":       _v_revenge_tp_mode,
+    "tp_mult":       _v_float(0.05, 50, "El take profit de la venganza va de 0.05 a 50 veces la pérdida (ej. 1)"),
+    "tp_usd":        _v_revenge_tp_usd,
 }
 
 
@@ -1723,7 +1785,10 @@ class BotPosition:
     revenge:        bool  = False
     revenge_of:     int   = 0       # trade_id de la operación que venga
     revenge_loss:   float = 0.0     # PnL con el que cerró esa operación (negativo)
-    revenge_tp_usd: float = 0.0     # TP (USD, positivo): la pérdida a recuperar, o el fijado a mano
+    # TP de la venganza: sale de los ajustes (× la pérdida o fijo en USD) salvo
+    # que se fije a mano en la posición (revenge_tp_manual → manda revenge_tp_usd).
+    revenge_tp_usd: float = 0.0     # TP fijado a mano (USD, positivo); al abrir, el TP de ese momento
+    revenge_tp_manual: bool = False
     revenge_sl_usd: float = 0.0     # SL automático de la venganza (USD, negativo)
     # ── Excursiones de la operación (PnL no realizado, USD y % del notional) ──
     opened_ts:    float = field(default_factory=time.time)
@@ -1799,9 +1864,12 @@ class BotPosition:
     def exit_tp(self) -> float:
         """Take profit en USD (positivo). Normal: notional × multiplicador del TP.
         Invertida: espejo del SL del normal (1 tramo → notional×0.251, 2+ → |SL estándar|).
-        Venganza: la pérdida de la operación que venga (o el TP fijado a mano)."""
+        Venganza: según los ajustes de la venganza (la pérdida de la original × N o
+        un importe fijo), o el TP fijado a mano en la posición."""
         if self.revenge:
-            return self.revenge_tp_usd
+            if self.revenge_tp_manual:
+                return self.revenge_tp_usd
+            return _revenge_tp_auto(self.revenge_loss)
         if self.inverted:
             return -self.sl_usd
         return self.notional * TAKE_PROFIT_FRACTION
@@ -1875,9 +1943,11 @@ class BotPosition:
         return "1er tramo" if len(self.fills) == 1 else "estándar"
 
     @property
-    def revenge_tp_manual(self) -> bool:
-        """True si el TP de la venganza ya no es la pérdida de la original (editado a mano)."""
-        return self.revenge and abs(self.revenge_tp_usd + self.revenge_loss) > 1e-9
+    def revenge_tp_src(self) -> str:
+        """De dónde sale el TP de una venganza: "manual" | "loss" (× la pérdida) | "usd" (fijo)."""
+        if not self.revenge:
+            return ""
+        return "manual" if self.revenge_tp_manual else REVENGE.tp_mode
 
 
 _POS_FIELDS = {f.name for f in fields(BotPosition)}
@@ -1910,8 +1980,13 @@ def _position_from_dict(d: Any) -> Optional[BotPosition]:
             setattr(pos, k, float(getattr(pos, k) or 0.0))
         pos.sl_manual, pos.inverted = bool(pos.sl_manual), bool(pos.inverted)
         pos.revenge, pos.revenge_of = bool(pos.revenge), int(pos.revenge_of or 0)
-        if pos.revenge and pos.revenge_tp_usd <= 0:      # venganza sin TP válido: el de su pérdida
-            pos.revenge_tp_usd = abs(pos.revenge_loss) or REVENGE.min_loss_usd
+        if "revenge_tp_manual" in d:
+            pos.revenge_tp_manual = bool(d.get("revenge_tp_manual"))
+        else:   # guardada por la versión anterior: su TP automático era justo la pérdida
+            pos.revenge_tp_manual = bool(pos.revenge and pos.revenge_tp_usd > 0
+                                         and abs(pos.revenge_tp_usd + pos.revenge_loss) > 1e-9)
+        if pos.revenge_tp_manual and pos.revenge_tp_usd <= 0:   # TP manual sin valor válido
+            pos.revenge_tp_manual = False
         if pos.direction not in ("LONG", "SHORT"):
             return None
         return pos
@@ -2803,6 +2878,8 @@ class TradingBot:
         self._gstop_rearm_at:   float = 0.0
         self.global_stop_triggers: int = 0
         self.global_stop_last: Dict[str, Any] = {}
+        self.global_tp_triggers: int = 0                     # TP global (ganancia total ≥ +X)
+        self.global_tp_last: Dict[str, Any] = {}
         self.blocked_counts: Dict[str, int] = {}             # tipo de bloqueo → nº de señales frenadas
         self.blocked_recent: deque = deque(maxlen=40)        # últimas señales frenadas (para la web)
         self._block_lock = threading.Lock()
@@ -2939,7 +3016,10 @@ class TradingBot:
         r = REVENGE
         self.log(f"⚔️ VENGANZA {'activa' if r.enabled else 'apagada'}: SL con pérdida de −{r.min_loss_usd:g} a "
                  f"−{r.max_loss_usd:g} USD → posición contraria con {r.notional_mult:g}× el notional, "
-                 f"TP = la pérdida, SL {r.sl_usd:g} USD, sin DCA ni venganza de la venganza")
+                 f"{self._revenge_tp_txt()}, SL {r.sl_usd:g} USD, sin DCA ni venganza de la venganza")
+        g = RISK
+        self.log(f"🛑 Stop global {'activo en ' + format(g.global_stop_usd, 'g') + ' USD' if g.global_stop_enabled else 'apagado'}"
+                 f" · 🎯 TP global {'activo en +' + format(g.global_tp_usd, 'g') + ' USD' if g.global_tp_enabled else 'apagado'}")
         if QSTASH_TOKEN:
             threading.Thread(target=_qstash_keepalive, args=(self.store, self.log),
                              daemon=True, name="QStashKeepAlive").start()
@@ -3878,7 +3958,8 @@ class TradingBot:
                         pos.revenge        = True
                         pos.revenge_of     = int(revenge["orig_trade_id"])
                         pos.revenge_loss   = float(revenge["orig_pnl"])
-                        pos.revenge_tp_usd = float(revenge["tp_usd"])
+                        pos.revenge_tp_usd = float(revenge["tp_usd"])   # informativo: manda el ajuste
+                        pos.revenge_tp_manual = False
                         pos.revenge_sl_usd = float(revenge["sl_usd"])
                         # La venganza sustituye al cooldown que dejó la original: al
                         # cerrarse ella, el símbolo entra en su propio cooldown.
@@ -3905,7 +3986,7 @@ class TradingBot:
                     f"{' invertida' if revenge.get('orig_inverted') else ''} cerró por SL con "
                     f"{revenge['orig_pnl']:+.4f} USD) → {direction} {symbol} | {notional:.2f} USDT "
                     f"({revenge['mult']:g}× {revenge['orig_notional']:.2f}) | qty={qty} | px={price:.6f} | "
-                    f"trade_id={trade_id} | TP=+{tp_now:.4f} USD (recupera la pérdida) | "
+                    f"trade_id={trade_id} | TP=+{tp_now:.4f} USD ({self._revenge_tp_txt(short=True)}) | "
                     f"SL={sl_now:.4f} USD | sin DCA" + no_exec
                 )
             else:
@@ -4142,8 +4223,17 @@ class TradingBot:
     # Operación que cierra por SU stop loss con una pérdida dentro del rango
     # (REVENGE.min_loss_usd … max_loss_usd, por defecto 1 a 2 USD) → en el mismo
     # símbolo se abre la posición CONTRARIA con REVENGE.notional_mult × el notional
-    # con el que cerró, TP = esa pérdida (la recupera) y SL = REVENGE.sl_usd.
-    # La venganza no hace DCA y, si pierde, no se venga otra vez.
+    # con el que cerró, TP = esa pérdida × REVENGE.tp_mult (o un TP fijo en USD) y
+    # SL = REVENGE.sl_usd. La venganza no hace DCA y, si pierde, no se venga otra vez.
+
+    @staticmethod
+    def _revenge_tp_txt(short: bool = False) -> str:
+        """Regla vigente del TP de la venganza, para el log. short=True → sin "TP"."""
+        if REVENGE.tp_mode == "usd":
+            return "fijo" if short else f"TP fijo +{REVENGE.tp_usd:g} USD"
+        if abs(REVENGE.tp_mult - 1.0) < 1e-12:
+            return "recupera la pérdida" if short else "TP = la pérdida (la recupera)"
+        return f"{REVENGE.tp_mult:g}× la pérdida" if short else f"TP = {REVENGE.tp_mult:g}× la pérdida"
 
     @staticmethod
     def _revenge_plan(symbol: str, reason: str, pnl: float, direction: str, inverted: bool,
@@ -4160,7 +4250,7 @@ class TradingBot:
             "direction":      _opp(direction),        # la posición contraria a la original (lado real)
             "notional":       round(notional * mult, 8),
             "mult":           mult,
-            "tp_usd":         loss,                    # busca recuperar lo perdido
+            "tp_usd":         _revenge_tp_auto(loss),  # con los ajustes de ahora (× la pérdida o fijo)
             "sl_usd":         -abs(REVENGE.sl_usd),
             "orig_trade_id":  int(trade_id or 0),
             "orig_pnl":       pnl,
@@ -4270,12 +4360,13 @@ class TradingBot:
             "last":            dict(self.revenge_last),
             "first_notional":  first_nt,
             "first_sl_loss":   first_sl,
+            "first_tp":        _revenge_tp_auto(first_sl),               # TP que tendría su venganza
             "first_in_band":   REVENGE.min_loss_usd - 1e-9 <= first_sl <= REVENGE.max_loss_usd + 1e-9,
         }
 
     def set_revenge(self, data: dict) -> dict:
-        """Cambia (validando) los ajustes de la venganza y los guarda. Un SL nuevo se
-        aplica también a las venganzas abiertas (salvo SL fijado a mano).
+        """Cambia (validando) los ajustes de la venganza y los guarda. Un SL o un TP
+        nuevos se aplican también a las venganzas abiertas (salvo los fijados a mano).
         ValueError si algún valor es inválido (en ese caso no se aplica nada)."""
         if not isinstance(data, dict):
             raise ValueError("Cuerpo JSON inválido")
@@ -4283,30 +4374,38 @@ class TradingBot:
         changed = _apply_revenge_dict(data, strict=True)
         if not changed:
             raise ValueError("No se recibió ningún ajuste de la venganza reconocido")
-        updated: List[str] = []
-        if "sl_usd" in changed:
-            with self.lock:
-                for sym, p in self.positions.items():
-                    if p.status == "OPEN" and p.fills and p.revenge:
-                        p.revenge_sl_usd = REVENGE.sl_usd
-                        old = p.sl_usd
-                        p.refresh_auto_sl()
-                        if p.sl_usd != old:
-                            updated.append(sym)
+        diffs = [f"{k}: {before[k]} → {v}" for k, v in changed.items() if before.get(k) != v]
+        sl_changed = before["sl_usd"] != REVENGE.sl_usd
+        tp_changed = any(before[k] != getattr(REVENGE, k) for k in ("tp_mode", "tp_mult", "tp_usd"))
+        sl_updated: List[str] = []
+        tp_updated: List[str] = []
+        with self.lock:
+            for sym, p in self.positions.items():
+                if p.status != "OPEN" or not p.fills or not p.revenge:
+                    continue
+                if sl_changed:
+                    p.revenge_sl_usd = REVENGE.sl_usd
+                    old = p.sl_usd
+                    p.refresh_auto_sl()
+                    if p.sl_usd != old:
+                        sl_updated.append(sym)
+                if tp_changed and not p.revenge_tp_manual:   # su TP sale de los ajustes: cambia ya
+                    tp_updated.append(f"{sym} +{p.exit_tp():.4f}")
         err = _save_settings()
         if err:
             self.log(f"No pude guardar ajustes: {err}")
-        diffs = [f"{k}: {before[k]} → {v}" for k, v in changed.items() if before.get(k) != v]
         r = REVENGE
         self.log(f"⚔️ VENGANZA {'activada' if r.enabled else 'desactivada'}: SL de "
                  f"−{r.min_loss_usd:g} a −{r.max_loss_usd:g} USD → posición contraria con "
-                 f"{r.notional_mult:g}× el notional, TP = la pérdida, SL {r.sl_usd:g} USD"
+                 f"{r.notional_mult:g}× el notional, {self._revenge_tp_txt()}, SL {r.sl_usd:g} USD"
                  + (f" ({', '.join(diffs)})" if diffs else " (sin cambios)")
-                 + (f" | SL aplicado a las venganzas abiertas: {', '.join(sorted(updated))}" if updated else ""))
+                 + (f" | SL aplicado a las venganzas abiertas: {', '.join(sorted(sl_updated))}" if sl_updated else "")
+                 + (f" | TP nuevo de las venganzas abiertas: {', '.join(sorted(tp_updated))}" if tp_updated else ""))
         self.persist_state()
         for sym in self._open_position_symbols():
-            self._enqueue(sym)
-        return {"revenge": self.revenge_view(), "updated": sorted(updated)}
+            self._enqueue(sym)                  # reevalúa ya: un TP más bajo puede estar alcanzado
+        return {"revenge": self.revenge_view(), "updated": sorted(set(sl_updated)
+                                                                   | {t.split(' ')[0] for t in tp_updated})}
 
     # ── Estadísticas MFE / MAE ────────────────────────────────────────────────
 
@@ -4392,6 +4491,8 @@ class TradingBot:
             "global_stop":        {"triggers": self.global_stop_triggers,
                                    "last": dict(self.global_stop_last),
                                    "rearm_at": self._gstop_rearm_at},
+            "global_tp":          {"triggers": self.global_tp_triggers,
+                                   "last": dict(self.global_tp_last)},
         }
 
     def _state_signature(self, state: dict) -> Tuple[str, str, str]:
@@ -4515,6 +4616,12 @@ class TradingBot:
             if isinstance(gs.get("last"), dict) and gs.get("last"):
                 self.global_stop_last = dict(gs["last"])
             self._gstop_rearm_at = max(self._gstop_rearm_at, _num(gs.get("rearm_at")))
+        gt = state.get("global_tp") if isinstance(state.get("global_tp"), dict) else {}
+        if gt:
+            self.global_tp_triggers = max(self.global_tp_triggers if merge else 0,
+                                          int(_num(gt.get("triggers"))))
+            if isinstance(gt.get("last"), dict) and gt.get("last"):
+                self.global_tp_last = dict(gt["last"])
 
         # 3) Estadísticas MFE/MAE (se unen sin duplicar)
         with self._stats_lock:
@@ -4840,7 +4947,7 @@ class TradingBot:
     def set_take_profit_manual(self, symbol: str, tp_usd: float) -> bool:
         """Fija un take profit MANUAL (USD, positivo) para una posición INVERTIDA
         abierta (el espejo del SL manual de una normal: el bot ya no lo cambia) o
-        para un trade de VENGANZA (sustituye a la pérdida que buscaba recuperar).
+        para un trade de VENGANZA (deja de seguir el TP de los ajustes de la venganza).
         ValueError si la posición es normal."""
         symbol = symbol.upper().strip()
         with self.lock:
@@ -4848,7 +4955,8 @@ class TradingBot:
             if not pos or pos.status != "OPEN":
                 return False
             if pos.revenge:
-                pos.revenge_tp_usd = abs(float(tp_usd))
+                pos.revenge_tp_usd    = abs(float(tp_usd))
+                pos.revenge_tp_manual = True
                 kind = f"venganza de #{pos.revenge_of}"
             elif not pos.inverted:
                 raise ValueError(f"{symbol} es una posición normal: su take profit es notional × "
@@ -4958,7 +5066,7 @@ class TradingBot:
         changed = _apply_risk_dict(data, strict=True)
         if not changed:
             raise ValueError("No se recibió ningún ajuste de riesgo reconocido")
-        if any(k.startswith("global_stop") for k in changed):
+        if any(k.startswith(("global_stop", "global_tp")) for k in changed):
             self._gstop_rearm_at = 0.0          # un umbral nuevo se evalúa ya
         err = _save_settings()
         if err:
@@ -5126,6 +5234,8 @@ class TradingBot:
             "sl_fraction":  TAKE_PROFIT_FRACTION,                        # SL = −notional × esto
             "global_tp":    -RISK.global_stop_usd,                       # TP global
             "global_on":    RISK.global_stop_enabled,
+            "global_sl":    -abs(RISK.global_tp_usd),                    # stop global (espejo del TP global)
+            "global_sl_on": RISK.global_tp_enabled,
         }
 
     def set_inverted(self, enabled: bool) -> dict:
@@ -5156,6 +5266,7 @@ class TradingBot:
                     f"(UP → SHORT, DOWN → LONG). TP = +{r['tp_first']:.4f} USD con 1 tramo, "
                     f"+{r['tp_std']:.2f} USD desde el 2.º | SL = −{r['sl_fraction'] * 100:g}% del notional"
                     f" | TP global = " + (f"+{r['global_tp']:.2f} USD" if r["global_on"] else "apagado")
+                    + " | stop global = " + (f"{r['global_sl']:.2f} USD" if r["global_sl_on"] else "apagado")
                     + " | DCA en los mismos precios que el modo normal (a favor de la posición)" + keep)
             else:
                 self.log("🔄 MODO NORMAL: las posiciones nuevas se abren en la dirección de la señal "
@@ -5202,12 +5313,18 @@ class TradingBot:
                     if p.status == "OPEN" and p.fills and (book is None or p.inverted == book)]
 
     def _check_global_stop(self) -> None:
-        """Dos "libros", cada uno con su regla (mismo valor, signo opuesto):
-          • Normales:   PnL no realizado ≤ global_stop_usd (−5)  → STOP GLOBAL: las cierra.
-          • Invertidas: PnL no realizado ≥ −global_stop_usd (+5) → TP GLOBAL:   las cierra.
-        Tras dispararse, si así está configurado, pausa las entradas nuevas.
-        Corre en el loop del bot."""
-        if not RISK.global_stop_enabled or self._close_all_active or not self.store.manage_ok:
+        """Dos reglas por PnL no realizado, cada una en los dos "libros" (mismo valor,
+        signo opuesto en el invertido, que opera al revés en los mismos precios):
+          • Stop global (global_stop_usd, −5):
+              normales   PnL ≤ −5 → STOP GLOBAL: las cierra
+              invertidas PnL ≥ +5 → TP GLOBAL:   las cierra (espejo)
+          • TP global (global_tp_usd, +X):
+              normales   PnL ≥ +X → TP GLOBAL:   las cierra y asegura la ganancia
+              invertidas PnL ≤ −X → STOP GLOBAL: las cierra (espejo)
+        Primero se miran los stops. Tras dispararse una regla, si así está configurado
+        en ella, se pausan las entradas nuevas (con o sin tiempo). Corre en el loop."""
+        if (not (RISK.global_stop_enabled or RISK.global_tp_enabled)
+                or self._close_all_active or not self.store.manage_ok):
             return
         now = time.time()
         if now - self._gstop_last_check < 0.2 or now < self._gstop_rearm_at:
@@ -5215,29 +5332,51 @@ class TradingBot:
         self._gstop_last_check = now
         with self.lock:
             tot_n, n_n, tot_i, n_i = self._unrealized_books_locked()
-        thr = RISK.global_stop_usd                       # negativo (ej. −5)
-        if n_n and tot_n <= thr:
-            kind, total, n_open, book, target = "SL", tot_n, n_n, False, thr
-        elif n_i and tot_i >= -thr:
-            kind, total, n_open, book, target = "TP", tot_i, n_i, True, -thr
-        else:
+        stop = RISK.global_stop_usd                      # negativo (ej. −5)
+        gain = abs(RISK.global_tp_usd)                   # positivo (ej. +10)
+        # (regla, tipo de cierre, PnL, nº de posiciones, libro invertido, umbral, ¿se cumple?)
+        rules = []
+        if RISK.global_stop_enabled:
+            rules.append(("stop", "SL", tot_n, n_n, False, stop, bool(n_n) and tot_n <= stop))
+        if RISK.global_tp_enabled:
+            rules.append(("tp", "SL", tot_i, n_i, True, -gain, bool(n_i) and tot_i <= -gain))
+            rules.append(("tp", "TP", tot_n, n_n, False, gain, bool(n_n) and tot_n >= gain))
+        if RISK.global_stop_enabled:
+            rules.append(("stop", "TP", tot_i, n_i, True, -stop, bool(n_i) and tot_i >= -stop))
+        hit = next((r for r in rules if r[-1]), None)
+        if hit is None:
             return
+        rule, kind, total, n_open, book, target, _ = hit
         self._gstop_rearm_at = now + GLOBAL_STOP_REARM_S
-        self.global_stop_triggers += 1
-        self.global_stop_last = {
+        last = {
             "ts": now, "pnl": total, "threshold": target, "positions": n_open, "kind": kind,
+            "book": "inverted" if book else "normal",
             "at": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
-        if kind == "SL":
-            self.log(f"🛑 STOP GLOBAL: PnL no realizado {total:.4f} ≤ {thr:.2f} USD "
-                     f"→ cierre de {n_open} posición(es)" + (" normales" if n_i else ""))
-            why = f"Stop global disparado ({total:.2f} USD ≤ {thr:.2f})"
+        if rule == "stop":
+            self.global_stop_triggers += 1
+            self.global_stop_last = last
         else:
-            self.log(f"🎯 TP GLOBAL: PnL no realizado de las invertidas {total:+.4f} ≥ {-thr:+.2f} USD "
-                     f"→ cierre de {n_open} posición(es) invertida(s)")
-            why = f"TP global alcanzado ({total:+.2f} USD ≥ {-thr:+.2f})"
-        if RISK.global_stop_pause:
-            mins = RISK.global_stop_pause_min or None
+            self.global_tp_triggers += 1
+            self.global_tp_last = last
+        mirror = " (espejo del TP global)" if rule == "tp" else " (espejo del stop global)"
+        if kind == "SL":
+            who = (" de las invertidas" + mirror) if book else ""
+            self.log(f"🛑 STOP GLOBAL{who}: PnL no realizado {total:.4f} ≤ {target:.2f} USD "
+                     f"→ cierre de {n_open} posición(es)"
+                     + ((" invertida(s)" if book else " normales") if (n_i and n_n) or book else ""))
+            why = f"Stop global disparado ({total:.2f} USD ≤ {target:.2f})"
+        else:
+            who = (" de las invertidas" + mirror) if book else ""
+            self.log(f"🎯 TP GLOBAL{who}: PnL no realizado {total:+.4f} ≥ {target:+.2f} USD "
+                     f"→ cierre de {n_open} posición(es)"
+                     + ((" invertida(s)" if book else " normales") if (n_i and n_n) or book else "")
+                     + " para asegurar la ganancia")
+            why = f"TP global alcanzado ({total:+.2f} USD ≥ {target:+.2f})"
+        pause_on = RISK.global_stop_pause if rule == "stop" else RISK.global_tp_pause
+        pause_min = RISK.global_stop_pause_min if rule == "stop" else RISK.global_tp_pause_min
+        if pause_on:
+            mins = pause_min or None
             want_until = (now + mins * 60.0) if mins else 0.0
             # Pausa si no la hay, o si la que hay es con tiempo y acaba antes que esta
             if (not self._entries_paused_now(now)
@@ -5303,6 +5442,12 @@ class TradingBot:
             "gstop_pause_min":   RISK.global_stop_pause_min,
             "gstop_triggers":    self.global_stop_triggers,
             "gstop_last":        dict(self.global_stop_last),
+            "gtp_enabled":       RISK.global_tp_enabled,
+            "gtp_usd":           RISK.global_tp_usd,
+            "gtp_pause":         RISK.global_tp_pause,
+            "gtp_pause_min":     RISK.global_tp_pause_min,
+            "gtp_triggers":      self.global_tp_triggers,
+            "gtp_last":          dict(self.global_tp_last),
             "unrealized":        unreal,
             "open_positions":    n_open,
             "unreal_normal":     unreal_n,
@@ -5693,6 +5838,8 @@ class TradingBot:
                 "revenge_of":      pos.revenge_of,
                 "revenge_loss":    pos.revenge_loss,
                 "revenge_tp_manual": pos.revenge_tp_manual,
+                "revenge_tp_src":  pos.revenge_tp_src,     # manual | loss (× la pérdida) | usd (fijo)
+                "revenge_tp_mult": REVENGE.tp_mult,
                 "signal_dir":      pos.signal_dir,
                 "target":          pos.exit_tp(),        # TP real (USD)
                 "take_profit_price": pos.tp_price(),
@@ -6075,7 +6222,7 @@ HTML = r"""<!doctype html>
     .readout dt { color: var(--muted); font-size: 13px; }
     .readout dd { margin: 0; font-family: var(--font-c); font-weight: 600; font-size: 19px; }
 
-    .interlocks { display: grid; grid-template-columns: repeat(4, 1fr); }
+    .interlocks { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
     .il { position: relative; padding: 16px 18px 18px; border-left: 1px solid var(--rule); display: flex; flex-direction: column; gap: 6px; text-align: left; background: none; border-top: 0; border-right: 0; border-bottom: 0; cursor: pointer; min-width: 0; }
     .il:first-child { border-left: 0; }
     .il:hover { background: rgba(255,255,255,.025); }
@@ -6188,7 +6335,7 @@ HTML = r"""<!doctype html>
     .acc > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 12px; padding: 13px 18px; }
     .acc > summary:hover { background: rgba(255,255,255,.02); }
     .acc-name { font-weight: 600; flex: 1; }
-    .acc-val { font-family: var(--font-c); font-weight: 600; color: var(--muted); font-size: 15px; white-space: nowrap; }
+    .acc-val { font-family: var(--font-c); font-weight: 600; color: var(--muted); font-size: 15px; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
     .acc-val.on { color: var(--txt); }
     .acc-body { padding: 2px 18px 18px; display: grid; gap: 14px; }
     .acc-body p.hint { margin: 0; color: var(--muted); font-size: 13.5px; }
@@ -6335,6 +6482,7 @@ HTML = r"""<!doctype html>
       .interlocks { grid-template-columns: 1fr 1fr; }
       .il:nth-child(odd) { border-left: 0; }
       .il:nth-child(n+3) { border-top: 1px solid var(--rule); }
+      .il:last-child:nth-child(odd) { grid-column: 1 / -1; }
       .statgrid { grid-template-columns: 1fr 1fr; }
       .statgrid > div:nth-child(3) { border-left: 0; }
       .statgrid > div:nth-child(n+3) { border-top: 1px solid var(--rule); }
@@ -6431,6 +6579,12 @@ HTML = r"""<!doctype html>
       </button>
       <button class="il" id="ilGstop" data-go="cfg-gstop" data-state="off">
         <span class="il-head"><i class="lamp off"></i><span id="ilGstopName">Stop global</span></span>
+        <span class="il-val" data-v>—</span>
+        <span class="il-bar"><i data-b></i></span>
+        <span class="il-sub" data-s></span>
+      </button>
+      <button class="il" id="ilGtp" data-go="cfg-gtp" data-state="off">
+        <span class="il-head"><i class="lamp off"></i><span id="ilGtpName">TP global</span></span>
         <span class="il-val" data-v>—</span>
         <span class="il-bar"><i data-b></i></span>
         <span class="il-sub" data-s></span>
@@ -6535,6 +6689,25 @@ HTML = r"""<!doctype html>
           </div>
         </details>
 
+        <details class="acc" id="cfg-gtp">
+          <summary><span class="acc-name" id="gtName">Take profit global por PnL</span><span class="acc-val" id="cvGtp">—</span><span class="chev"></span></summary>
+          <div class="acc-body" data-panel>
+            <p class="hint" id="gtHint">Si la suma del PnL no realizado de las posiciones normales llega a esta ganancia, el bot las cierra todas a mercado, una a una, y asegura lo ganado.</p>
+            <label class="switch"><input type="checkbox" id="gtEnabled"><span class="track"></span><span id="gtEnabledTxt">TP global activado</span></label>
+            <div class="field">
+              <label for="gtUsd" id="gtUsdLbl">Cerrar todo cuando el PnL no realizado sea igual o mayor que (USD)</label>
+              <input id="gtUsd" type="number" step="0.5" placeholder="5">
+            </div>
+            <label class="switch"><input type="checkbox" id="gtPause"><span class="track"></span>Pausar entradas nuevas tras dispararse</label>
+            <div class="seg" id="gtSeg" role="radiogroup" aria-label="Duración de la pausa tras el TP global">
+              <label><input type="radio" name="gtDur" value="manual" checked><span>Hasta que la reanude</span></label>
+              <label><input type="radio" name="gtDur" value="timed"><span>Durante</span><input class="mins" id="gtPauseMin" type="number" min="1" max="10080" step="1" inputmode="numeric" value="30" aria-label="Minutos de pausa tras el TP global"><span>min</span></label>
+            </div>
+            <p class="hint" id="gtLast"></p>
+            <button class="btn primary" id="gtSave">Guardar TP global</button>
+          </div>
+        </details>
+
         <details class="acc" id="cfg-exposure">
           <summary><span class="acc-name">Límite de exposición</span><span class="acc-val" id="cvExposure">—</span><span class="chev"></span></summary>
           <div class="acc-body" data-panel>
@@ -6624,11 +6797,18 @@ HTML = r"""<!doctype html>
         <details class="acc" id="cfg-rev">
           <summary><span class="acc-name">Trade de venganza</span><span class="acc-val" id="cvRev">—</span><span class="chev"></span></summary>
           <div class="acc-body" data-panel>
-            <p class="hint">Cuando una operación cierra por su stop loss con una pérdida dentro de este rango, el bot abre al momento la posición contraria en el mismo símbolo con el notional multiplicado. Su take profit es la pérdida de la original (busca recuperarla) y su stop loss es fijo. No hace DCA y, si pierde, no se venga otra vez. Pasa por la pausa, la exposición y los filtros BTC como cualquier entrada nueva.</p>
+            <p class="hint">Cuando una operación cierra por su stop loss con una pérdida dentro de este rango, el bot abre al momento la posición contraria en el mismo símbolo con el notional multiplicado. Su take profit es la pérdida de la original multiplicada (×1 la recupera justo) o una ganancia fija en USD, y su stop loss es fijo. No hace DCA y, si pierde, no se venga otra vez. Pasa por la pausa, la exposición y los filtros BTC como cualquier entrada nueva.</p>
             <label class="switch"><input type="checkbox" id="rvEnabled"><span class="track"></span>Venganza activada</label>
             <div class="field-row">
               <div class="field"><label for="rvMin">Pérdida mínima (USD)</label><input id="rvMin" type="number" step="0.1" min="0.01" inputmode="decimal" placeholder="1"></div>
               <div class="field"><label for="rvMax">Pérdida máxima (USD)</label><input id="rvMax" type="number" step="0.1" min="0.01" inputmode="decimal" placeholder="2"></div>
+            </div>
+            <div class="field">
+              <label id="rvTpLbl">Take profit de la venganza</label>
+              <div class="seg" id="rvTpSeg" role="radiogroup" aria-labelledby="rvTpLbl">
+                <label><input type="radio" name="rvTp" value="loss" checked><span>Pérdida ×</span><input class="mins" id="rvTpMult" type="number" min="0.05" max="50" step="0.1" inputmode="decimal" value="1" aria-label="Veces la pérdida de la original"></label>
+                <label><input type="radio" name="rvTp" value="usd"><span>Fijo +</span><input class="mins" id="rvTpUsd" type="number" min="0.01" step="0.1" inputmode="decimal" value="2" aria-label="Take profit fijo en USD"><span>USD</span></label>
+              </div>
             </div>
             <div class="field-row">
               <div class="field"><label for="rvMult">Notional (× el de la original)</label><input id="rvMult" type="number" step="0.5" min="0.1" max="20" inputmode="decimal" placeholder="2"></div>
@@ -6889,6 +7069,11 @@ function negVal(id) {
   return isFinite(v) && v !== 0 ? -Math.abs(v) : NaN;
 }
 function numVal(id) { const v = parseFloat(String(q(id).value).replace(',', '.')); return isFinite(v) ? v : NaN; }
+// Valores positivos: acepta "5", "+5" o "-5" y devuelve 5
+function posVal(id) {
+  const v = parseFloat(String(q(id).value).replace(',', '.'));
+  return isFinite(v) && v !== 0 ? Math.abs(v) : NaN;
+}
 function lsGet(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
 function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* sin almacenamiento */ } }
 function fmtMin(m) {
@@ -7057,6 +7242,10 @@ function renderGate(g) {
   if (edSig !== _edSig) { _edSig = edSig; edExplain(); updateLadderMeta(); }
 
   // 4) Stop global (normales: −X) · TP global (invertidas: +X)
+  // Qué regla está cerrando ahora (cada una tiene su espejo en el libro invertido)
+  const caRun = !!_closeAll.running, caO = _closeAll.origin, caB = _closeAll.book;
+  const stopRun = caRun && ((caO === 'GLOBAL' && caB === false) || (caO === 'GLOBAL_TP' && caB === true));
+  const tpRun = caRun && ((caO === 'GLOBAL_TP' && caB === false) || (caO === 'GLOBAL' && caB === true));
   const stop = n(g.gstop_usd), tgt = -stop;
   const unN = n(g.unreal_normal), unI = n(g.unreal_inverted);
   const last = g.gstop_last || {};
@@ -7065,14 +7254,14 @@ function renderGate(g) {
   let bar;
   if (!inv) {
     bar = (unN < 0 && stop < 0) ? unN / stop : 0;
-    st = !g.gstop_enabled ? 'off' : globalRun ? 'bad' : bar >= 0.6 ? 'warn' : 'ok';
-    val = `<span class="${cls(unN)}">${sgn(unN, 2)}</span><small>/ ${fx(stop, 2)} USD</small>`;
+    st = !g.gstop_enabled ? 'off' : stopRun ? 'bad' : bar >= 0.6 ? 'warn' : 'ok';
+    val = `<span class="${cls(unN)}">${sgn(unN, 2)}</span><small>/ ${fx(stop, 2)}</small>`;
     sub = !g.gstop_enabled ? 'Desactivado' : trig || `Cierra todo al llegar a ${fx(stop, 2)} USD`;
     if (g.gstop_enabled && n(g.open_inverted)) sub += `. Invertidas: ${sgn(unI, 2)} de +${fx(tgt, 2)}`;
   } else {
     bar = (unI > 0 && tgt > 0) ? unI / tgt : 0;
-    st = !g.gstop_enabled ? 'off' : globalRun ? 'warn' : 'ok';
-    val = `<span class="${cls(unI)}">${sgn(unI, 2)}</span><small>/ +${fx(tgt, 2)} USD</small>`;
+    st = !g.gstop_enabled ? 'off' : stopRun ? 'warn' : 'ok';
+    val = `<span class="${cls(unI)}">${sgn(unI, 2)}</span><small>/ +${fx(tgt, 2)}</small>`;
     sub = !g.gstop_enabled ? 'Desactivado' : trig || `Cierra las invertidas al llegar a +${fx(tgt, 2)} USD`;
     if (g.gstop_enabled && n(g.open_normal)) sub += `. Normales: ${sgn(unN, 2)} de ${fx(stop, 2)}`;
   }
@@ -7083,10 +7272,38 @@ function renderGate(g) {
     ? `Último disparo${last.kind === 'TP' ? ' (TP global)' : last.kind === 'SL' ? ' (stop global)' : ''}: ${last.at || hhmm(last.ts)} con PnL ${sgn(last.pnl, 2)} USD sobre ${n(last.positions)} posición(es).`
     : 'Aún no se ha disparado desde el arranque.');
 
+  // 5) TP global (normales: +X) · stop global de las invertidas (espejo: −X)
+  const gain = Math.abs(n(g.gtp_usd)), lastT = g.gtp_last || {};
+  const trigT = n(g.gtp_triggers)
+    ? `${g.gtp_triggers} disparo${g.gtp_triggers === 1 ? '' : 's'}, el último a las ${hhmm(lastT.ts)}` : '';
+  if (!inv) {
+    bar = (unN > 0 && gain > 0) ? unN / gain : 0;
+    st = !g.gtp_enabled ? 'off' : tpRun ? 'warn' : 'ok';
+    val = `<span class="${cls(unN)}">${sgn(unN, 2)}</span><small>/ +${fx(gain, 2)}</small>`;
+    sub = !g.gtp_enabled ? 'Desactivado' : trigT || `Cierra todo al llegar a +${fx(gain, 2)} USD`;
+    if (g.gtp_enabled && n(g.open_inverted)) sub += `. Invertidas: ${sgn(unI, 2)} de −${fx(gain, 2)}`;
+  } else {
+    bar = (unI < 0 && gain > 0) ? -unI / gain : 0;
+    st = !g.gtp_enabled ? 'off' : tpRun ? 'bad' : bar >= 0.6 ? 'warn' : 'ok';
+    val = `<span class="${cls(unI)}">${sgn(unI, 2)}</span><small>/ −${fx(gain, 2)}</small>`;
+    sub = !g.gtp_enabled ? 'Desactivado' : trigT || `Cierra las invertidas al llegar a −${fx(gain, 2)} USD`;
+    if (g.gtp_enabled && n(g.open_normal)) sub += `. Normales: ${sgn(unN, 2)} de +${fx(gain, 2)}`;
+  }
+  tile('ilGtp', st, val, sub, g.gtp_enabled ? bar : 0);
+  setTxt('cvGtp', !g.gtp_enabled ? 'Apagado' : inv ? `−${fx(gain, 2)} USD` : `+${fx(gain, 2)} USD`);
+  q('cvGtp').classList.toggle('on', !!g.gtp_enabled);
+  setTxt('gtLast', n(g.gtp_triggers)
+    ? `Último disparo${lastT.kind === 'SL' ? ' (stop global de las invertidas)' : ' (TP global)'}: ${lastT.at || hhmm(lastT.ts)} con PnL ${sgn(lastT.pnl, 2)} USD sobre ${n(lastT.positions)} posición(es).`
+    : 'Aún no se ha disparado desde el arranque.');
+
   // Formularios de riesgo (en modo invertido el stop global se muestra como TP global: +X)
   fillChk('gsEnabled', g.gstop_enabled); fillVal('gsUsd', fx(inv ? tgt : stop, 2)); fillChk('gsPause', g.gstop_pause);
   fillSeg('gsSeg', 'gsPauseMin', g.gstop_pause_min);
   q('gsSeg').classList.toggle('dim', !q('gsPause').checked);
+  // TP global (en modo invertido se muestra como el stop global de las invertidas: −X)
+  fillChk('gtEnabled', g.gtp_enabled); fillVal('gtUsd', fx(inv ? -gain : gain, 2)); fillChk('gtPause', g.gtp_pause);
+  fillSeg('gtSeg', 'gtPauseMin', g.gtp_pause_min);
+  q('gtSeg').classList.toggle('dim', !q('gtPause').checked);
   fillChk('exEnabled', g.exposure_enabled); fillVal('exMax', +fx(mx, 2)); fillChk('exDca', g.exposure_include_dca);
   fillChk('btcEnabled', g.btc_enabled); fillVal('btcThr', +fx(thr, 2)); fillVal('btcMode', g.btc_mode || 'all');
   fillChk('btcUpEnabled', g.btc_up_enabled); fillVal('btcUpThr', +fx(thrUp, 2)); fillVal('btcUpMode', g.btc_up_mode || 'short');
@@ -7115,8 +7332,12 @@ function posItem(p) {
   const slPct = n(p.notional) > 0 ? fx(-n(p.stop_loss_usd) / n(p.notional) * 100, 2) : '0';
   const sideTitle = rev ? ` title="Venganza de #${n(p.revenge_of)}: al revés de la original, que cerró con ${sgn(p.revenge_loss, 3)} USD"`
                   : inv ? ` title="Invertida: la señal era ${esc(p.signal_dir)}"` : '';
-  const tpNote = rev ? (p.revenge_tp_manual ? ', fijado a mano' : `, recupera ${sgn(p.revenge_loss, 3)} de #${n(p.revenge_of)}`)
-               : inv ? ', ' + esc(p.sl_mode || '') : '';
+  const tpSrc = p.revenge_tp_src || (p.revenge_tp_manual ? 'manual' : 'loss');
+  const tpNote = !rev ? (inv ? ', ' + esc(p.sl_mode || '') : '')
+    : tpSrc === 'manual' ? ', fijado a mano'
+    : tpSrc === 'usd' ? ', fijo de la venganza'
+    : Math.abs(n(p.revenge_tp_mult) - 1) < 1e-9 ? `, recupera ${sgn(p.revenge_loss, 3)} de #${n(p.revenge_of)}`
+    : `, la pérdida de #${n(p.revenge_of)} (${sgn(p.revenge_loss, 3)}) × ${fmtN(p.revenge_tp_mult, 2)}`;
   return `<details id="prow_${sym}" data-sym="${sym}"${_openPos.has(sym) ? ' open' : ''}>
     <summary>
       <span class="side ${side.toLowerCase()}${inv ? ' inv' : ''}${rev ? ' rev' : ''}"${sideTitle}>${side}</span>
@@ -7180,7 +7401,7 @@ function renderPositions(positions) {
   positions.forEach(p => { _posMeta[p.symbol] = { opened: n(p.opened_ts) }; });
   const sig = JSON.stringify(positions.map(p => [p.symbol, p.direction, p.avg_entry, p.qty, p.notional, p.target,
     p.stop_loss_usd, p.sl_mode, (p.fills || []).length, p.exec_url, p.exec_current, p.inverted,
-    p.revenge, p.revenge_of, p.revenge_tp_manual]));
+    p.revenge, p.revenge_of, p.revenge_tp_manual, p.revenge_tp_src, p.revenge_tp_mult]));
   if (sig !== _posSig) {
     _posSig = sig;
     const live = new Set(positions.map(p => p.symbol));
@@ -7758,6 +7979,30 @@ function saveGlobalStop() {
     : `${what} guardado en ${inv ? '+' + fx(-usd, 2) : fx(usd, 2)} USD` + (!pause ? ', sin pausa'
       : dv.minutes ? `, pausa de ${fmtMin(dv.minutes)}` : ', pausa hasta reanudar'));
 }
+function saveGlobalTp() {
+  // Se guarda siempre como ganancia (+X). En modo invertido el campo muestra −X, el stop
+  // global de las invertidas (su espejo): posVal acepta 5, +5 o −5 y devuelve 5.
+  const inv = !!_inv, usd = posVal('gtUsd'), enabled = q('gtEnabled').checked;
+  if (isNaN(usd)) {
+    toast(inv ? 'Escribe la pérdida a la que se cierran las invertidas, por ejemplo 5 o -5.'
+              : 'Escribe la ganancia a la que se cierra todo, por ejemplo 5.', 'bad');
+    return;
+  }
+  const pause = q('gtPause').checked, dv = segValue('gtSeg', 'gtPauseMin');
+  if (pause && dv.error) { toast(dv.error, 'bad'); q('gtPauseMin').focus(); return; }
+  const g = _gate || {};
+  const unN = n(g.unreal_normal), nN = n(g.open_normal), unI = n(g.unreal_inverted), nI = n(g.open_inverted);
+  if (enabled && nN > 0 && unN >= usd &&
+      !confirm(`El PnL de las posiciones normales ya es ${sgn(unN, 2)} USD, así que el TP global las cerrará de inmediato.\n\n¿Guardar igualmente?`)) return;
+  if (enabled && nI > 0 && unI <= -usd &&
+      !confirm(`El PnL de las posiciones invertidas ya es ${sgn(unI, 2)} USD, así que su stop global las cerrará de inmediato.\n\n¿Guardar igualmente?`)) return;
+  const body = { global_tp_enabled: enabled, global_tp_usd: usd, global_tp_pause: pause };
+  if (!dv.error) body.global_tp_pause_min = dv.minutes || 0;
+  const what = inv ? 'Stop global de las invertidas' : 'TP global';
+  saveRisk('gtSave', body, !enabled ? `${what} desactivado`
+    : `${what} guardado en ${inv ? '−' : '+'}${fx(usd, 2)} USD` + (!pause ? ', sin pausa'
+      : dv.minutes ? `, pausa de ${fmtMin(dv.minutes)}` : ', pausa hasta reanudar'));
+}
 function saveExposure() {
   const mx = numVal('exMax');
   if (isNaN(mx) || mx <= 0) { toast('La exposición máxima debe ser un número positivo, por ejemplo 800.', 'bad'); return; }
@@ -7960,15 +8205,30 @@ async function saveTp() {
 
 // ── Trade de venganza ───────────────────────────────────────────────────────
 let _rev = null;
+// Texto corto del TP de la venganza: "TP = pérdida", "TP ×1.5 la pérdida" o "TP +2 USD"
+function revTpShort(mode, mult, usd) {
+  if (mode === 'usd') return `TP +${fmtN(usd, 2)}`;
+  return Math.abs(n(mult) - 1) < 1e-9 ? 'TP = pérdida' : `TP ${fmtN(mult, 2)}× pérdida`;
+}
+function revTpMode() { const r = q('rvTpSeg').querySelector('input[name="rvTp"]:checked'); return r ? r.value : 'loss'; }
+function fillRevTp(mode, mult, usd) {
+  const seg = q('rvTpSeg');
+  if (seg.querySelector('[data-dirty]') || seg.contains(document.activeElement)) return;
+  seg.querySelector(`input[value="${mode === 'usd' ? 'usd' : 'loss'}"]`).checked = true;
+  fillVal('rvTpMult', fmtN(mult, 2)); fillVal('rvTpUsd', fmtN(usd, 2));
+  segSync('rvTpSeg');
+}
 function renderRevenge(rv) {
   if (!rv) return;
   _rev = rv;
   const on = !!rv.enabled;
-  setTxt('cvRev', on ? `−${fmtN(rv.min_loss_usd, 2)} a −${fmtN(rv.max_loss_usd, 2)} USD, ${fmtN(rv.notional_mult, 2)}×, SL −${fmtN(Math.abs(n(rv.sl_usd)), 2)}` : 'Apagado');
+  setTxt('cvRev', on ? `${revTpShort(rv.tp_mode, rv.tp_mult, rv.tp_usd)} · SL −${fmtN(Math.abs(n(rv.sl_usd)), 2)} · ${fmtN(rv.notional_mult, 2)}×` : 'Apagado');
+  q('cvRev').title = on ? `Pérdidas de −${fmtN(rv.min_loss_usd, 2)} a −${fmtN(rv.max_loss_usd, 2)} USD → posición contraria con ${fmtN(rv.notional_mult, 2)}× el notional` : '';
   q('cvRev').classList.toggle('on', on);
   fillChk('rvEnabled', on);
   fillVal('rvMin', fmtN(rv.min_loss_usd, 2)); fillVal('rvMax', fmtN(rv.max_loss_usd, 2));
   fillVal('rvMult', fmtN(rv.notional_mult, 2)); fillVal('rvSl', fmtN(rv.sl_usd, 2));
+  fillRevTp(rv.tp_mode, rv.tp_mult, rv.tp_usd);
   revExplain();
   const k = n(rv.open), op = n(rv.opened), bl = n(rv.blocked), last = rv.last || {};
   let st = (k ? `${k} abierta${k === 1 ? '' : 's'} ahora (${(rv.open_symbols || []).join(', ')}). ` : 'Ninguna abierta ahora. ')
@@ -7979,36 +8239,53 @@ function renderRevenge(rv) {
   }
   setTxt('rvStatus', st);
 }
-function revExplain() {
-  const rv = _rev || {}, on = q('rvEnabled').checked;
+// Lee y valida el formulario de la venganza: { body } o { error }
+function revForm() {
   const lo = Math.abs(numVal('rvMin')), hi = Math.abs(numVal('rvMax')), mult = numVal('rvMult'), sl = negVal('rvSl');
-  if (!(lo > 0) || !(hi > 0) || !(mult > 0) || isNaN(sl)) { setTxt('rvExplain', 'Escribe el rango de pérdida, el multiplicador y el stop loss.'); return; }
-  if (lo > hi) { setTxt('rvExplain', 'La pérdida mínima no puede ser mayor que la máxima.'); return; }
+  const mode = revTpMode(), tpMult = Math.abs(numVal('rvTpMult')), tpUsd = Math.abs(numVal('rvTpUsd'));
+  if (!(lo >= 0.01) || !(hi >= 0.01)) return { error: 'Escribe la pérdida mínima y la máxima en USD, por ejemplo 1 y 2.' };
+  if (lo > hi) return { error: 'La pérdida mínima no puede ser mayor que la máxima.' };
+  if (!(mult >= 0.1 && mult <= 20)) return { error: 'El multiplicador del notional va de 0.1 a 20, por ejemplo 2.' };
+  if (isNaN(sl)) return { error: 'Escribe el stop loss de la venganza en USD, por ejemplo -8.' };
+  if (mode === 'loss' && !(tpMult >= 0.05 && tpMult <= 50)) return { error: 'El take profit va de 0.05 a 50 veces la pérdida, por ejemplo 1 (la recupera justo) o 1.5.' };
+  if (mode === 'usd' && !(tpUsd >= 0.01)) return { error: 'Escribe la ganancia fija del take profit en USD, por ejemplo 2.' };
+  const body = { enabled: q('rvEnabled').checked, min_loss_usd: lo, max_loss_usd: hi, notional_mult: mult, sl_usd: sl, tp_mode: mode };
+  if (tpMult >= 0.05 && tpMult <= 50) body.tp_mult = tpMult;
+  if (tpUsd >= 0.01) body.tp_usd = tpUsd;
+  return { body };
+}
+function revExplain() {
+  const rv = _rev || {}, f = revForm();
+  segSync('rvTpSeg');
+  if (f.error) { setTxt('rvExplain', f.error); return; }
+  const b = f.body, on = b.enabled;
   const frac = n(_d && _d.first_tranche_sl_fraction) || 0.251;
   const nt = n(rv.first_notional) || 5, loss = n(rv.first_sl_loss) || nt * frac;
-  const inBand = loss >= lo - 1e-9 && loss <= hi + 1e-9;
-  let s = (on ? 'Se vengan' : 'Apagada. Al activarla se vengarían') + ` los stop loss de −${fx(lo, 2)} a −${fx(hi, 2)} USD. `;
+  const inBand = loss >= b.min_loss_usd - 1e-9 && loss <= b.max_loss_usd + 1e-9;
+  const tp = b.tp_mode === 'usd' ? b.tp_usd : loss * b.tp_mult, net = tp - loss;
+  let s = (on ? 'Se vengan' : 'Apagada. Al activarla se vengarían') + ` los stop loss de −${fx(b.min_loss_usd, 2)} a −${fx(b.max_loss_usd, 2)} USD. `;
   s += inBand
-    ? `Ejemplo con tu escalera: un LONG de ${fmtN(nt)} USDT que cierra por su stop loss en −${fx(loss, 3)} USD abre al momento un SHORT de ${fmtN(nt * mult)} USDT con TP +${fx(loss, 3)} USD y SL ${sgn(sl, 2)} USD.`
+    ? `Ejemplo con tu escalera: un LONG de ${fmtN(nt)} USDT que cierra por su stop loss en −${fx(loss, 3)} USD abre al momento un SHORT de ${fmtN(nt * b.notional_mult)} USDT con TP +${fx(tp, 3)} USD`
+      + (b.tp_mode === 'usd' ? '' : ` (la pérdida × ${fmtN(b.tp_mult)})`) + ` y SL ${sgn(b.sl_usd, 2)} USD. `
+      + (Math.abs(net) < 0.0005 ? 'Si llega al TP, la pareja queda en cero.' : `Si llega al TP, la pareja queda en ${sgn(net, 3)} USD.`)
     : `Ojo: el stop loss del primer tramo (${fmtN(nt)} USDT × ${fmtN(frac)} = −${fx(loss, 3)} USD) queda fuera de este rango, así que esas pérdidas no se vengarían.`;
+  s += ' El TP y el SL nuevos se aplican también a las venganzas abiertas, salvo las que tengan el suyo fijado a mano.';
   const g = _gate || {};
-  if (g.gstop_enabled && n(g.gstop_usd) > sl) s += ` El stop global (${fx(g.gstop_usd, 2)} USD) también cuenta las venganzas y puede cerrarlas antes de su stop loss.`;
+  if (g.gstop_enabled && n(g.gstop_usd) > b.sl_usd) s += ` El stop global (${fx(g.gstop_usd, 2)} USD) también cuenta las venganzas y puede cerrarlas antes de su stop loss.`;
   setTxt('rvExplain', s);
 }
 async function saveRevenge() {
-  const lo = Math.abs(numVal('rvMin')), hi = Math.abs(numVal('rvMax')), mult = numVal('rvMult'), sl = negVal('rvSl');
-  if (!(lo >= 0.01) || !(hi >= 0.01)) { toast('Escribe la pérdida mínima y la máxima en USD, por ejemplo 1 y 2.', 'bad'); return; }
-  if (lo > hi) { toast('La pérdida mínima no puede ser mayor que la máxima.', 'bad'); return; }
-  if (!(mult >= 0.1 && mult <= 20)) { toast('El multiplicador del notional va de 0.1 a 20, por ejemplo 2.', 'bad'); return; }
-  if (isNaN(sl)) { toast('Escribe el stop loss de la venganza en USD, por ejemplo -8.', 'bad'); return; }
-  const on = q('rvEnabled').checked, btn = q('rvSave');
+  const f = revForm();
+  if (f.error) { toast(f.error, 'bad'); return; }
+  const b = f.body, btn = q('rvSave');
   busy(btn, true);
   try {
-    const data = await postJSON('/api/set-revenge', { enabled: on, min_loss_usd: lo, max_loss_usd: hi, notional_mult: mult, sl_usd: sl });
+    const data = await postJSON('/api/set-revenge', b);
     clearDirty(btn.closest('[data-panel]'));
     if (data.revenge) renderRevenge(data.revenge);
-    toast(on ? `Venganza activa: stop loss de −${fx(lo, 2)} a −${fx(hi, 2)} USD → ${fmtN(mult)}× al revés, SL ${sgn(sl, 2)} USD`
-             : 'Venganza desactivada', 'ok');
+    toast(b.enabled ? `Venganza activa: stop loss de −${fx(b.min_loss_usd, 2)} a −${fx(b.max_loss_usd, 2)} USD → ${fmtN(b.notional_mult)}× al revés, `
+                      + `${revTpShort(b.tp_mode, b.tp_mult, b.tp_usd)}, SL ${sgn(b.sl_usd, 2)} USD`
+                    : 'Venganza desactivada', 'ok');
     requestFull(true);
   } catch (e) { toast('No se guardó: ' + e.message, 'bad'); }
   finally { busy(btn, false); }
@@ -8112,8 +8389,19 @@ function applyModeLabels(inv) {
   q('tpInput').placeholder = inv ? '-0.1' : '0.07';
   setBtnLabel('tpSave', inv ? 'Guardar stop loss' : 'Guardar take profit');
   setTxt('ilGstopName', inv ? 'TP global' : 'Stop global');
+  // TP global: en modo invertido se ve como el stop global de las invertidas (−X)
+  setTxt('gtName', inv ? 'Stop global por PnL (espejo del TP global)' : 'Take profit global por PnL');
+  setTxt('gtEnabledTxt', inv ? 'Stop global de las invertidas activado' : 'TP global activado');
+  setTxt('gtHint', inv
+    ? 'Si la suma del PnL no realizado de las posiciones invertidas cae hasta este valor, el bot las cierra todas a mercado, una a una. Es el TP global del modo normal con el signo cambiado.'
+    : 'Si la suma del PnL no realizado de las posiciones normales llega a esta ganancia, el bot las cierra todas a mercado, una a una, y asegura lo ganado.');
+  setTxt('gtUsdLbl', inv ? 'Cerrar las invertidas cuando su PnL no realizado sea igual o menor que (USD)'
+                         : 'Cerrar todo cuando el PnL no realizado sea igual o mayor que (USD)');
+  q('gtUsd').placeholder = inv ? '-5' : '5';
+  setBtnLabel('gtSave', inv ? 'Guardar stop global' : 'Guardar TP global');
+  setTxt('ilGtpName', inv ? 'Stop global' : 'TP global');
   // El signo de esos campos cambia: se descarta lo que estuviera a medio editar
-  ['gsUsd', 'gslInput', 'tpInput'].forEach(id => { const el = q(id); delete el.dataset.dirty; if (document.activeElement === el) el.blur(); });
+  ['gsUsd', 'gtUsd', 'gslInput', 'tpInput'].forEach(id => { const el = q(id); delete el.dataset.dirty; if (document.activeElement === el) el.blur(); });
 }
 function renderMode(inv, rules, g) {
   if (rules) _rules = rules;
@@ -8136,6 +8424,7 @@ function renderMode(inv, rules, g) {
       ['Take profit', `+${fx(r.tp_first, 3)} USD con 1 tramo, +${fx(r.tp_std, 2)} USD desde el 2.º`],
       ['Stop loss', `−${+(n(r.sl_fraction) * 100).toFixed(2)} % del notional (−${+n(r.sl_fraction).toFixed(4)})`],
       ['TP global', r.global_on ? `+${fx(r.global_tp, 2)} USD` : 'apagado (el stop global está desactivado)'],
+      ['Stop global', r.global_sl_on ? `${sgn(r.global_sl, 2)} USD` : 'apagado (el TP global está desactivado)'],
       ['DCA', 'en los mismos precios que el normal: cuando el precio va a favor'],
     ];
     setHTML(q('invMap'), items.map(([k, v]) => `<li><span>${k}</span><b>${esc(v)}</b></li>`).join(''));
@@ -8151,6 +8440,7 @@ async function toggleInvert() {
       + `• Take profit +${fx(r.tp_first, 3)} USD con 1 tramo, +${fx(r.tp_std, 2)} USD desde el 2.º\n`
       + `• Stop loss −${+(n(r.sl_fraction) * 100).toFixed(2)} % del notional\n`
       + `• TP global ${r.global_on ? '+' + fx(r.global_tp, 2) + ' USD' : 'apagado'}\n`
+      + `• Stop global ${r.global_sl_on ? sgn(r.global_sl, 2) + ' USD' : 'apagado'}\n`
       + '• DCA en los mismos precios que el normal (cuando el precio va a favor)\n\n'
       + 'Las posiciones abiertas no cambian.'
     : '¿Volver al modo normal?\n\nLas posiciones nuevas se abrirán en la dirección de la señal. Las invertidas abiertas siguen con sus reglas hasta cerrarse.';
@@ -8180,6 +8470,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   q('gsSave').addEventListener('click', saveGlobalStop);
+  q('gtSave').addEventListener('click', saveGlobalTp);
   q('exSave').addEventListener('click', saveExposure);
   q('btcSave').addEventListener('click', saveBtc);
   q('btcUpSave').addEventListener('click', saveBtcUp);
@@ -8207,7 +8498,13 @@ document.addEventListener('DOMContentLoaded', () => {
   q('gslSave').addEventListener('click', saveGlobalSl);
   q('tpSave').addEventListener('click', saveTp);
   q('rvSave').addEventListener('click', saveRevenge);
-  ['rvEnabled', 'rvMin', 'rvMax', 'rvMult', 'rvSl'].forEach(id => ['input', 'change'].forEach(ev => q(id).addEventListener(ev, revExplain)));
+  ['rvEnabled', 'rvMin', 'rvMax', 'rvMult', 'rvSl', 'rvTpMult', 'rvTpUsd'].forEach(id => ['input', 'change'].forEach(ev => q(id).addEventListener(ev, revExplain)));
+  q('rvTpSeg').addEventListener('change', revExplain);
+  // Tocar la casilla de una opción del TP la elige
+  [['rvTpMult', 'loss'], ['rvTpUsd', 'usd']].forEach(([id, val]) => ['focus', 'input'].forEach(ev => q(id).addEventListener(ev, () => {
+    const r = q('rvTpSeg').querySelector(`input[value="${val}"]`);
+    if (!r.checked) { r.checked = true; r.dataset.dirty = '1'; r.dispatchEvent(new Event('change', { bubbles: true })); }
+  })));
   q('emaSave').addEventListener('click', saveEma);
   q('pauseBtn').addEventListener('click', togglePause);
   q('invBtn').addEventListener('click', toggleInvert);
@@ -8230,6 +8527,8 @@ document.addEventListener('DOMContentLoaded', () => {
   segInit('execSeg', 'execMin', 'execMin');
   segInit('gsSeg', 'gsPauseMin', '');
   q('gsPause').addEventListener('change', () => q('gsSeg').classList.toggle('dim', !q('gsPause').checked));
+  segInit('gtSeg', 'gtPauseMin', '');
+  q('gtPause').addEventListener('change', () => q('gtSeg').classList.toggle('dim', !q('gtPause').checked));
   q('execPauseBtn').addEventListener('click', toggleExecPause);
   q('execSave').addEventListener('click', saveExecUrl);
   q('execTest').addEventListener('click', testExecUrl);
@@ -8745,6 +9044,7 @@ def api_risk():
 def api_set_risk():
     """Cambia en caliente cualquier ajuste de riesgo. Cuerpo JSON parcial, p. ej.:
     {"global_stop_enabled": true, "global_stop_usd": -5}
+    {"global_tp_enabled": true, "global_tp_usd": 10, "global_tp_pause": true, "global_tp_pause_min": 60}
     {"exposure_enabled": true, "max_exposure_usd": 800, "exposure_include_dca": false}
     {"btc_filter_enabled": true, "btc_filter_threshold": 0, "btc_filter_mode": "all"}
     {"btc_up_enabled": true, "btc_up_threshold": 0, "btc_up_mode": "short"}
