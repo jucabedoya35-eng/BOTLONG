@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 import urllib.response
 
-from flask import Flask, Response, jsonify, make_response, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -1130,8 +1130,19 @@ CLOSE_ERROR_BACKOFF_S  = float(os.getenv("CLOSE_ERROR_BACKOFF_S",  "3"))    # pa
 STATE_PERSIST_SECS     = float(os.getenv("STATE_PERSIST_SECS",     "10"))   # guardado periódico del estado
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
-LIVE_POLL_MS   = int(os.getenv("LIVE_POLL_MS",   "250"))    # el navegador pide precios cada 250 ms (payload mínimo)
-STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "1500"))   # estructura completa de las tablas
+# Ancho de banda: Render cobra lo que el bot ENVÍA (respuestas al navegador, peticiones
+# a Upstash…), no lo que recibe de Binance, y el plan Hobby trae 5 GB al mes. Antes una
+# pestaña abierta gastaba ~7 GB al día. Ahora: respuestas comprimidas (gzip),
+# /api/status solo reenvía el historial, los cooldowns, el log y las señales frenadas
+# cuando cambian, y el ritmo baja cuando nadie mira:
+#   • en vivo (alguien usa el panel): precios cada LIVE_POLL_MS, resto cada STATUS_POLL_MS
+#   • modo ahorro (PANEL_IDLE_S sin tocar el panel): PANEL_IDLE_LIVE_MS / PANEL_IDLE_STATUS_MS
+#   • pestaña oculta: nada, salvo un /health cada 4 min para que Render no duerma el bot
+LIVE_POLL_MS         = int(os.getenv("LIVE_POLL_MS",   "1000"))       # precios y PnL (antes 250 ms)
+STATUS_POLL_MS       = int(os.getenv("STATUS_POLL_MS", "5000"))       # resto del panel (antes 1500 ms)
+PANEL_IDLE_S         = float(os.getenv("PANEL_IDLE_S", "300"))        # sin tocar el panel → ahorro (0 = nunca)
+PANEL_IDLE_LIVE_MS   = int(os.getenv("PANEL_IDLE_LIVE_MS", "15000"))
+PANEL_IDLE_STATUS_MS = int(os.getenv("PANEL_IDLE_STATUS_MS", "60000"))
 
 # ── Resto de parámetros operativos ────────────────────────────────────────────
 COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS",     "86400"))
@@ -2051,8 +2062,11 @@ def _position_from_dict(d: Any) -> Optional[BotPosition]:
 #                          nueva antes de parar la vieja; la nueva espera a que
 #                          la vieja guarde y suelte, así nunca operan dos a la vez.
 # Cada cambio (apertura, DCA, cierre, SL/TP, ajuste, cooldown) se guarda en ~1 s;
-# el MFE/MAE de las abiertas, cada minuto. Gasto: ~4.000 comandos al día (la capa
-# gratis de Upstash da 500.000 al mes).
+# el MFE/MAE de las abiertas, cada STORE_HEARTBEAT_S (5 min). Gasto: ~4.000 comandos
+# al día (la capa gratis de Upstash da 500.000 al mes).
+# Ancho de banda (Render cobra lo que el bot ENVÍA, también a Upstash): la conexión
+# HTTPS se reutiliza (sin un saludo TLS nuevo por petición) y los scripts Lua van
+# por EVALSHA (40 bytes de huella en vez del script entero en cada renovación).
 # QStash NO guarda datos (es una cola de mensajes HTTP). Con QSTASH_TOKEN el bot
 # crea en QStash un horario que visita /health cada 10 min: así Render free no lo
 # duerme por falta de visitas (dormido no vigila precios ni gestiona posiciones).
@@ -2062,7 +2076,8 @@ UPSTASH_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN", "gQAAAAAAA1L-AAIgcDEyYWRi
 STORE_PREFIX  = re.sub(r"[^A-Za-z0-9_.:-]", "", os.getenv("STORE_PREFIX", "botema") or "") or "botema"
 STORE_LOCK_TTL_S  = max(30.0, float(os.getenv("STORE_LOCK_TTL_S", "75")))
 STORE_RENEW_S     = max(5.0, min(STORE_LOCK_TTL_S / 3.0, float(os.getenv("STORE_RENEW_S", "25"))))
-STORE_HEARTBEAT_S = max(10.0, float(os.getenv("STORE_HEARTBEAT_S", "60")))   # MFE/MAE de las abiertas
+STORE_HEARTBEAT_S = max(10.0, float(os.getenv("STORE_HEARTBEAT_S", "300")))  # MFE/MAE de las abiertas
+UPSTASH_KEEPALIVE_S = 45.0          # reutiliza la conexión si lleva menos de esto sin usarse
 STORE_MIN_GAP_S   = 1.0                                                       # agrupa ráfagas de cambios
 STORE_BOOT_WAIT_S = max(5.0, float(os.getenv("STORE_BOOT_WAIT_S", "20")))
 STORE_CLOSED_MAX  = 500
@@ -2108,6 +2123,9 @@ _LUA_RELEASE = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
 return 0
 """
+# Huellas SHA1 para EVALSHA (Redis las calcula igual sobre el texto del script)
+_LUA_SAVE_SHA    = hashlib.sha1(_LUA_SAVE.encode("utf-8")).hexdigest()
+_LUA_RELEASE_SHA = hashlib.sha1(_LUA_RELEASE.encode("utf-8")).hexdigest()
 
 
 class UpstashError(Exception):
@@ -2118,37 +2136,82 @@ class UpstashError(Exception):
 
 
 class UpstashRedis:
-    """Cliente mínimo de la API REST de Upstash Redis (solo librería estándar)."""
+    """Cliente mínimo de la API REST de Upstash Redis (solo librería estándar).
+    Reutiliza la conexión HTTPS (keep-alive): abrir una por petición costaba ~1 KB
+    de salida extra en cada guardado o renovación (saludo TLS y TCP).
+    Una sola petición a la vez: StateStore las serializa con su lock _io."""
 
     def __init__(self, url: str, token: str, timeout: float = 6.0) -> None:
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
+        u = urlsplit(self.url)
+        self._https = u.scheme.lower() == "https"
+        self._host = u.hostname or ""
+        self._port = u.port
+        self._path = u.path.rstrip("/")
+        self._conn: Optional[http.client.HTTPConnection] = None
+        self._conn_ts = 0.0
         self.calls = 0
         self.bytes_out = 0
         self.bytes_in = 0
+        self.connects = 0
+
+    def _drop(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _send(self, path: str, body: bytes) -> Tuple[int, bytes]:
+        """(código HTTP, cuerpo). Si la conexión reutilizada resulta estar cerrada por
+        el servidor, repite una vez con una nueva (un guardado repetido no hace daño:
+        los SET son idempotentes y los cierres/estadísticas se deduplican al restaurar)."""
+        headers = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json"}
+        for attempt in range(2):
+            if self._conn is not None and time.time() - self._conn_ts > UPSTASH_KEEPALIVE_S:
+                self._drop()                       # mucho rato sin usarse: el servidor ya la cerró
+            reused = self._conn is not None
+            if self._conn is None:
+                cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
+                self._conn = cls(self._host, self._port, timeout=self.timeout)
+                self.connects += 1
+            try:
+                self._conn.request("POST", (self._path + path) or "/", body=body, headers=headers)
+                resp = self._conn.getresponse()
+                raw = resp.read()
+            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError,
+                    http.client.CannotSendRequest, http.client.ResponseNotReady) as exc:
+                self._drop()
+                if reused and attempt == 0:
+                    continue                           # conexión vieja: otra vez con una nueva
+                raise UpstashError(f"sin conexión con Upstash: {exc}", 0)
+            except (socket.timeout, TimeoutError, OSError, http.client.HTTPException) as exc:
+                self._drop()
+                reason = getattr(exc, "reason", None) or exc
+                raise UpstashError(f"sin conexión con Upstash: {reason}", 0)
+            self._conn_ts = time.time()
+            if resp.will_close:
+                self._drop()
+            return resp.status, raw
+        raise UpstashError("sin conexión con Upstash", 0)
 
     def _post(self, path: str, payload: Any) -> Any:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        req = urllib.request.Request(self.url + path, data=body, method="POST", headers={
-            "Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
         self.calls += 1
         self.bytes_out += len(body)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read()
-        except urllib.error.HTTPError as exc:
+        status, raw = self._send(path, body)
+        if status >= 400:
             try:
-                detail = json.loads(exc.read() or b"{}").get("error", "")
+                detail = json.loads(raw or b"{}").get("error", "")
             except Exception:
                 detail = ""
-            msg = f"HTTP {exc.code}" + (f": {detail}" if detail else "")
-            if exc.code in (401, 403):
+            msg = f"HTTP {status}" + (f": {detail}" if detail else "")
+            if status in (401, 403):
                 msg += " (revisa UPSTASH_REDIS_REST_TOKEN)"
-            elif exc.code == 404:
+            elif status == 404:
                 msg += " (revisa UPSTASH_REDIS_REST_URL)"
-            raise UpstashError(msg, exc.code, fatal=exc.code in (401, 403, 404))
-        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
-            reason = getattr(exc, "reason", None) or exc
-            raise UpstashError(f"sin conexión con Upstash: {reason}", 0)
+            raise UpstashError(msg, status, fatal=status in (401, 403, 404))
         self.bytes_in += len(raw)
         try:
             return json.loads(raw)
@@ -2250,6 +2313,25 @@ class StateStore:
         self._flush_lock = threading.Lock()
         self._recheck = False
         self._last_hb_check = 0.0
+        self._evalsha_ok = True                 # False si Upstash no acepta EVALSHA (todo por EVAL)
+
+    def _eval(self, script: str, sha: str, keys: List[str], args: List[Any]) -> Any:
+        """Ejecuta un script Lua mandando solo su huella (EVALSHA). Si Upstash no lo
+        tiene en caché (NOSCRIPT: tras un reinicio o un failover suyo) lo manda entero
+        con EVAL, que además lo deja en caché para las siguientes. Requiere self._io."""
+        c = self.client
+        if self._evalsha_ok:
+            try:
+                return c.cmd("EVALSHA", sha, len(keys), *keys, *args)
+            except UpstashError as exc:
+                msg = str(exc).upper()
+                if "NOSCRIPT" in msg:
+                    pass                                  # sin el script en caché: EVAL
+                elif exc.status == 400 and ("UNKNOWN COMMAND" in msg or "NOT SUPPORTED" in msg):
+                    self._evalsha_ok = False              # EVALSHA no disponible: siempre EVAL
+                else:
+                    raise                                 # red, credenciales…: como antes
+        return c.cmd("EVAL", script, len(keys), *keys, *args)
 
     # ── Estado para el bot y la web ───────────────────────────────────────
     @property
@@ -2504,8 +2586,8 @@ class StateStore:
         with self._io:
             if self.status != "active":
                 return False
-            res = self.client.cmd("EVAL", _LUA_SAVE, 5, self.k_lock, self.k_config, self.k_state,
-                                  self.k_closed, self.k_stats, *argv)
+            res = self._eval(_LUA_SAVE, _LUA_SAVE_SHA,
+                             [self.k_lock, self.k_config, self.k_state, self.k_closed, self.k_stats], argv)
         if res in (0, "0", None):
             self._lost()
             return False
@@ -2561,7 +2643,7 @@ class StateStore:
         ok = bot._store_apply_threadsafe(data, "takeover")
         if not ok:
             with self._io:
-                self.client.cmd("EVAL", _LUA_RELEASE, 1, self.k_lock, self.instance_id)
+                self._eval(_LUA_RELEASE, _LUA_RELEASE_SHA, [self.k_lock], [self.instance_id])
             return False
         self._last_struct = None
         self._last_renew = time.time()
@@ -2587,7 +2669,7 @@ class StateStore:
         self._ok()
         if not bot._store_apply_threadsafe(data, "merge"):
             with self._io:
-                self.client.cmd("EVAL", _LUA_RELEASE, 1, self.k_lock, self.instance_id)
+                self._eval(_LUA_RELEASE, _LUA_RELEASE_SHA, [self.k_lock], [self.instance_id])
             return
         self.status, self.detail = "active", ""
         self.request_full_resync()
@@ -2650,7 +2732,7 @@ class StateStore:
             bot.log(f"⚠️ {reason}: no pude guardar el estado final en Upstash: {exc}")
         try:
             with self._io:
-                self.client.cmd("EVAL", _LUA_RELEASE, 1, self.k_lock, self.instance_id)
+                self._eval(_LUA_RELEASE, _LUA_RELEASE_SHA, [self.k_lock], [self.instance_id])
         except Exception:
             pass
         self.status = "standby"
@@ -6011,6 +6093,8 @@ class TradingBot:
             "latency_max_ms":    self.latency_max_ms,
             "live_poll_ms":      LIVE_POLL_MS,
             "status_poll_ms":    STATUS_POLL_MS,
+            "panel":             {"idle_s": PANEL_IDLE_S, "idle_live_ms": PANEL_IDLE_LIVE_MS,
+                                  "idle_status_ms": PANEL_IDLE_STATUS_MS},
             "min_gain_filter":   MIN_GAIN_FILTER,
             "safety_tick_secs":  SAFETY_TICK_SECS,
             # Símbolos / radar
@@ -6594,6 +6678,9 @@ HTML = r"""<!doctype html>
     .toast { background: var(--panel2); border: 1px solid var(--rule2); border-left: 3px solid var(--blue); border-radius: var(--r-md); padding: 10px 14px; font-size: 14px; box-shadow: 0 8px 24px rgba(0,0,0,.35); transition: opacity .3s, transform .3s; }
     .toast.ok { border-left-color: var(--ok); } .toast.bad { border-left-color: var(--bad); }
     .toast.out { opacity: 0; transform: translateY(6px); }
+    /* Aviso del modo ahorro (panel abierto sin usarse) */
+    .idle-pill { position: fixed; left: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 110; max-width: min(420px, calc(100vw - 32px)); background: var(--panel2); color: var(--txt); border: 1px solid var(--rule2); border-left: 3px solid var(--warn); border-radius: var(--r-md); padding: 10px 14px; font-size: 13.5px; text-align: left; cursor: pointer; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+    .idle-pill[hidden] { display: none; }
 
     /* ── Responsive ───────────────────────────────────────────────── */
     @media (max-width: 1100px) {
@@ -6653,7 +6740,7 @@ HTML = r"""<!doctype html>
       <span title="Entradas nuevas"><i id="lampEntries" class="lamp off"></i><span class="lbl" id="lblEntries">Entradas</span></span>
       <span title="Envío de operaciones al executor"><i id="lampExec" class="lamp off"></i><span class="lbl" id="lblExec">Executor</span></span>
       <span title="WebSocket de precios"><i id="lampWs" class="lamp off"></i><span class="lbl">Precios</span></span>
-      <span title="Refresco del panel"><i id="lampPoll" class="lamp off"></i><span class="lbl">Panel</span></span>
+      <span title="Refresco del panel"><i id="lampPoll" class="lamp off"></i><span class="lbl" id="lblPoll">Panel</span></span>
     </div>
   </div>
   <nav class="tabs" aria-label="Secciones">
@@ -7184,6 +7271,7 @@ HTML = r"""<!doctype html>
 </div>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
+<button type="button" id="idlePill" class="idle-pill" hidden></button>
 
 <script>
 // ── Utilidades ──────────────────────────────────────────────────────────────
@@ -7753,7 +7841,7 @@ function renderCloseAll(ca, openN) {
   } else { setTxt(msg, ''); }
 }
 
-// ── Render completo (cada ~1.5 s) ───────────────────────────────────────────
+// ── Render completo (cada STATUS_POLL_MS) ───────────────────────────────────
 function render(d) {
   if (!d) return;
   _d = d;
@@ -7761,6 +7849,13 @@ function render(d) {
   renderStore(d.store);
   if (n(d.live_poll_ms))   livePollMs   = Math.max(100, n(d.live_poll_ms));
   if (n(d.status_poll_ms)) statusPollMs = Math.max(500, n(d.status_poll_ms));
+  if (d.panel) {
+    idleMs = Math.max(0, n(d.panel.idle_s)) * 1000;
+    if (n(d.panel.idle_live_ms))   idleLiveMs   = Math.max(1000, n(d.panel.idle_live_ms));
+    if (n(d.panel.idle_status_ms)) idleStatusMs = Math.max(5000, n(d.panel.idle_status_ms));
+  }
+  // Estadísticas: solo cuando cambia el historial de cierres
+  if (d.sig && d.sig.closed_trades !== _statsSig) { _statsSig = d.sig.closed_trades; loadStats(); }
 
   const mode = d.mode || '—';
   setTxt('modeBadge', mode === 'REAL' ? 'Real' : mode === 'PAPER' ? 'Paper' : mode);
@@ -7952,11 +8047,15 @@ function renderStats(s) {
         <td class="${n(r.pct) > 20 ? 'neg' : n(r.pct) > 5 ? 'warn-t' : 'pos'}">${fx(r.pct, 0)} %</td></tr>`).join('')
     : '<tr><td colspan="3" class="muted">Aún no hay take profits registrados</td></tr>');
 }
-let statsTimer = null;
+// Las estadísticas solo cambian al cerrarse una operación: se piden al abrir el
+// panel y cuando cambia el historial de cierres (antes, cada 15 s aunque no cambiaran).
+let _statsSig = null;
 async function loadStats() {
-  try { const r = await fetch('/api/stats', { cache: 'no-store' }); if (r.ok) renderStats(await r.json()); }
-  catch (e) { /* reintenta en el siguiente ciclo */ }
-  finally { clearTimeout(statsTimer); statsTimer = setTimeout(loadStats, 15000); }
+  try {
+    const r = await fetch('/api/stats', { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    renderStats(await r.json());
+  } catch (e) { _statsSig = null; }                      // se reintenta en el próximo refresco
 }
 
 // ── Acciones ────────────────────────────────────────────────────────────────
@@ -8565,7 +8664,7 @@ async function cancelCloseAll() {
 async function closePosition(sym, btn) {
   if (!confirm(`¿Cerrar ${sym} a precio de mercado?\n\nNo se puede deshacer.`)) return;
   btn.disabled = true; btn.textContent = 'Cerrando…';
-  try { await postJSON(`/api/close/${sym}`); toast(`${sym} cerrada`, 'ok'); setTimeout(loadStats, 1500); }
+  try { await postJSON(`/api/close/${sym}`); toast(`${sym} cerrada`, 'ok'); }
   catch (e) { btn.disabled = false; btn.textContent = 'Cerrar posición'; toast(`No se cerró ${sym}: ${e.message}`, 'bad'); }
   finally { requestFull(true); }
 }
@@ -8768,6 +8867,8 @@ document.addEventListener('DOMContentLoaded', () => {
   q('cdCount').addEventListener('click', () => {
     const s = q('sec-radar'); s.open = true; s.scrollIntoView({ block: 'start' });
   });
+  // El log y las señales frenadas solo se descargan con su sección desplegada
+  ['sec-diag', 'sec-blk'].forEach(id => q(id).addEventListener('toggle', () => { if (q(id).open) requestFull(true); }));
 
   // Pausas con duración y executor
   segInit('pauseSeg', 'pauseMin', 'pauseMin');
@@ -8833,16 +8934,42 @@ setInterval(() => {
   tickUntil();
 }, 1000);
 
-// Con la pestaña en segundo plano se refresca mucho menos: el servidor sigue
-// recibiendo visitas (Render no lo duerme) sin gastar CPU en datos que nadie ve.
-const HIDDEN_LIVE_MS = 5000, HIDDEN_STATUS_MS = 15000;
+// ── Ritmo del panel (Render cobra lo que el bot envía: 5 GB al mes en Hobby) ──
+//  • en vivo: alguien usa el panel → precios cada livePollMs, resto cada statusPollMs
+//  • ahorro: visible pero sin tocarlo idleMs → mucho más lento (aviso abajo a la izquierda)
+//  • oculta: nada, salvo un /health cada 4 min para que Render free no duerma el bot
+let idleMs = 300000, idleLiveMs = 15000, idleStatusMs = 60000;
+const HIDDEN_PING_MS = 240000;
+let _lastInput = Date.now(), _idle = false, pingTimer = null;
+function panelMode() {
+  if (document.hidden) return 'hidden';
+  return (idleMs > 0 && Date.now() - _lastInput > idleMs) ? 'idle' : 'live';
+}
+function updateIdleUi() {
+  const idle = panelMode() === 'idle';
+  if (idle === _idle) return;
+  _idle = idle;
+  if (idle) setTxt('idlePill', `Modo ahorro de datos: el panel se actualiza cada ${Math.round(idleLiveMs / 1000)} s. `
+    + 'Toca o mueve el ratón para volver al tiempo real.');
+  q('idlePill').hidden = !idle;
+  setTxt('lblPoll', idle ? 'Panel: ahorro' : 'Panel');
+  if (!idle) { livePoll(); requestFull(true); }        // vuelve al tiempo real al momento
+}
+function markActive() {
+  _lastInput = Date.now();
+  if (_idle) updateIdleUi();
+}
+['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart', 'scroll', 'focus'].forEach(ev =>
+  window.addEventListener(ev, markActive, { passive: true, capture: true }));
+setInterval(updateIdleUi, 1000);
 
 // ── Bucle 1: precios en vivo ────────────────────────────────────────────────
 let liveTimer = null, liveFails = 0, liveInFlight = false;
 async function livePoll() {
   if (liveInFlight) return;
-  liveInFlight = true;
   clearTimeout(liveTimer);
+  if (document.hidden) return;                           // oculta: se reanuda al volver
+  liveInFlight = true;
   const t0 = performance.now();
   try {
     const r = await fetch('/api/live', { cache: 'no-store' });
@@ -8853,33 +8980,70 @@ async function livePoll() {
   finally {
     liveInFlight = false;
     setLamp(q('lampPoll'), (pollOk && liveOk) ? 'ok' : (pollOk || liveOk) ? 'warn' : 'bad');
-    const spent = performance.now() - t0, backoff = liveFails ? Math.min(3000, liveFails * 300) : 0;
-    const base = document.hidden ? HIDDEN_LIVE_MS : livePollMs;
-    liveTimer = setTimeout(livePoll, Math.max(0, base - spent) + backoff);
+    if (!document.hidden) {
+      const spent = performance.now() - t0, backoff = liveFails ? Math.min(3000, liveFails * 300) : 0;
+      const base = panelMode() === 'idle' ? idleLiveMs : livePollMs;
+      liveTimer = setTimeout(livePoll, Math.max(0, base - spent) + backoff);
+    }
   }
 }
+function schedulePing() {
+  clearTimeout(pingTimer);
+  pingTimer = setTimeout(() => {
+    if (!document.hidden) return;
+    fetch('/health', { cache: 'no-store' }).catch(() => {});
+    schedulePing();
+  }, HIDDEN_PING_MS);
+}
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) return;
+  if (document.hidden) { clearTimeout(liveTimer); clearTimeout(statusTimer); schedulePing(); return; }
+  clearTimeout(pingTimer);
+  _lastInput = Date.now();                               // volver a la pestaña cuenta como usarla
+  if (_idle) updateIdleUi();
   livePoll();
   requestFull(true);
 });
 
 // ── Bucle 2: estructura completa ────────────────────────────────────────────
+// Secciones pesadas de /api/status: el servidor solo las reenvía si cambiaron (el
+// panel le dice qué huella tiene de cada una). El log y las señales frenadas,
+// además, solo se piden con su sección desplegada.
+const _sec = {};
+const SEC_BOX = { events: 'sec-diag', blocked_recent: 'sec-blk' };
+function statusUrl() {
+  const have = ['closed_trades', 'cooldowns', 'events', 'blocked_recent'].map(k => {
+    const box = SEC_BOX[k] && q(SEC_BOX[k]);
+    if (box && !box.open) return `${k}:-`;
+    return _sec[k] ? `${k}:${_sec[k].sig}` : '';
+  }).filter(Boolean).join(',');
+  return '/api/status?have=' + encodeURIComponent(have);
+}
+function mergeSections(d) {
+  const sig = d.sig || {};
+  for (const k of Object.keys(sig)) {
+    if (d[k] !== null && d[k] !== undefined) _sec[k] = { sig: sig[k], data: d[k] };
+    else d[k] = _sec[k] ? _sec[k].data : (k === 'cooldowns' ? {} : []);
+  }
+  if (d.gate) d.gate.blocked_recent = Array.isArray(d.blocked_recent) ? d.blocked_recent : [];
+  return d;
+}
 let statusTimer = null, statusDelay = 1500, statusInFlight = false;
 async function pollStatus() {
   if (statusInFlight) return;
+  clearTimeout(statusTimer);
+  if (document.hidden) return;                           // oculta: se reanuda al volver
   statusInFlight = true; _lastFull = Date.now();
   try {
-    const r = await fetch('/api/status', { cache: 'no-store' });
+    const r = await fetch(statusUrl(), { cache: 'no-store' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    render(await r.json());
-    pollOk = true; statusDelay = document.hidden ? HIDDEN_STATUS_MS : statusPollMs;
+    render(mergeSections(await r.json()));
+    pollOk = true; statusDelay = panelMode() === 'idle' ? idleStatusMs : statusPollMs;
   } catch (e) {
     pollOk = false; statusDelay = Math.min(statusDelay * 1.5, 15000);
     console.warn('Error leyendo /api/status:', e.message);
   } finally {
     statusInFlight = false;
-    statusTimer = setTimeout(pollStatus, statusDelay);
+    if (!document.hidden) statusTimer = setTimeout(pollStatus, statusDelay);
   }
 }
 function requestFull(force) {
@@ -8891,7 +9055,7 @@ function requestFull(force) {
 
 livePoll();
 pollStatus();
-loadStats();
+if (document.hidden) schedulePing();                     // abierta en segundo plano
 </script>
 </body>
 </html>
@@ -8901,44 +9065,183 @@ loadStats();
 # RUTAS FLASK
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Ancho de banda (ver "Dashboard" arriba): lo que el bot envía al navegador cuenta en
+# los 5 GB al mes de Render. Las respuestas de más de 1 KB van comprimidas con gzip
+# (el JSON del panel ocupa ~12 veces menos) si el navegador lo acepta (todos lo hacen).
+_GZIP_MIN_BYTES = 1024
+_GZIP_LEVEL     = 6
+
+
+def _wants_gzip() -> bool:
+    try:
+        return request.accept_encodings.quality("gzip") > 0
+    except Exception:
+        return False
+
+
+def _gz(data: bytes) -> bytes:
+    return gzip.compress(data, compresslevel=_GZIP_LEVEL, mtime=0)
+
+
+def _dumps(obj: Any) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+
+
 class _JsonCache:
-    """Respuesta JSON ya serializada que comparten las peticiones que llegan en el
-    mismo instante: con el panel abierto en el PC y en el móvil el servidor ya no
-    construye el snapshot dos veces. Con una sola pestaña no cambia nada (el TTL es
-    la mitad del intervalo de refresco) y cualquier POST lo invalida."""
+    """Respuesta JSON ya serializada (y comprimida) que comparten las peticiones que
+    llegan en el mismo instante: con el panel abierto en el PC y en el móvil el
+    servidor ya no construye el snapshot dos veces. Con una sola pestaña no cambia
+    nada (el TTL es la mitad del intervalo de refresco) y cualquier POST lo invalida."""
 
     def __init__(self, ttl_s: float) -> None:
         self.ttl = max(0.0, float(ttl_s))
         self._lock = threading.Lock()
         self._body: Optional[bytes] = None
+        self._gzb: Optional[bytes] = None
         self._ts = 0.0
         self._gen = 0
 
     def invalidate(self) -> None:
         with self._lock:
-            self._body = None
+            self._body = self._gzb = None
             self._gen += 1
 
-    def get(self, build) -> bytes:
+    def get(self, build, gz: bool = False) -> Tuple[bytes, bool]:
+        """(cuerpo, comprimido?)."""
         with self._lock:
             if self._body is not None and time.monotonic() - self._ts < self.ttl:
-                return self._body
+                body = self._body
+                if not gz or len(body) < _GZIP_MIN_BYTES:
+                    return body, False
+                if self._gzb is None:
+                    self._gzb = _gz(body)
+                return self._gzb, True
             gen = self._gen
-        body = json.dumps(build(), ensure_ascii=False, separators=(",", ":"),
-                          default=str).encode("utf-8")
+        body = _dumps(build())
+        gzb = _gz(body) if (gz and len(body) >= _GZIP_MIN_BYTES) else None
         with self._lock:
             if gen == self._gen:                  # nadie lo invalidó mientras se construía
-                self._body, self._ts = body, time.monotonic()
-        return body
+                self._body, self._gzb, self._ts = body, gzb, time.monotonic()
+        return (gzb, True) if gzb is not None else (body, False)
 
 
-_STATUS_CACHE = _JsonCache(min(1.0, STATUS_POLL_MS / 2000.0))
+# Secciones pesadas de /api/status que casi nunca cambian (con 130 cierres son ~85 de
+# sus ~110 KB): el panel solo las recibe cuando cambian (ver _StatusCache).
+_STATUS_SECTIONS = ("closed_trades", "cooldowns", "events", "blocked_recent")
+
+
+def _status_parts(snap: dict) -> Tuple[bytes, Dict[str, bytes], Dict[str, str]]:
+    """(resto del snapshot en JSON, JSON de cada sección pesada, huella de cada una)."""
+    base = dict(snap)
+    gate = dict(base.get("gate") or {})
+    secs = {
+        "closed_trades":  base.pop("closed_trades", []),
+        "cooldowns":      base.pop("cooldowns", {}),
+        "events":         base.pop("events", []),
+        "blocked_recent": gate.pop("blocked_recent", []),
+    }
+    base["gate"] = gate
+    parts: Dict[str, bytes] = {}
+    sig: Dict[str, str] = {}
+    for name, val in secs.items():
+        frag = _dumps(val)
+        if name == "cooldowns":      # el tiempo restante cambia cada segundo: la huella solo mira la hora de salida
+            key = _dumps(sorted((s, round(_num((i or {}).get("unblock_ts")), 1))
+                                for s, i in (val or {}).items()))
+        else:
+            key = frag
+        parts[name] = frag
+        sig[name] = hashlib.sha1(key).hexdigest()[:12]
+    base["sig"] = sig
+    return _dumps(base), parts, sig
+
+
+def _parse_have(raw: Optional[str]) -> Optional[Dict[str, str]]:
+    """?have=closed_trades:huella,events:-,… → dict. None = sin parámetro (respuesta completa).
+    "-" = esa sección no hace falta ahora (está plegada en el panel)."""
+    if raw is None:
+        return None
+    out: Dict[str, str] = {}
+    for item in raw[:600].split(","):
+        name, _, val = item.partition(":")
+        if name in _STATUS_SECTIONS:
+            out[name] = val.strip()[:40]
+    return out
+
+
+class _StatusCache:
+    """/api/status por partes, compartido entre peticiones simultáneas como _JsonCache.
+      • sin ?have= → el snapshot completo de siempre (compatible con cualquier cliente);
+      • con ?have=sección:huella,… (el panel) → las secciones pesadas van al nivel
+        superior, como null si el navegador ya tiene esa huella (se listan en "same")
+        o si pidió no recibirla ("-"), y "sig" trae las huellas actuales."""
+
+    def __init__(self, ttl_s: float) -> None:
+        self.ttl = max(0.0, float(ttl_s))
+        self._lock = threading.Lock()
+        self._entry: Optional[Dict[Any, Any]] = None
+        self._ts = 0.0
+        self._gen = 0
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._entry = None
+            self._gen += 1
+
+    def _current(self) -> Dict[Any, Any]:
+        with self._lock:
+            if self._entry is not None and time.monotonic() - self._ts < self.ttl:
+                return self._entry
+            gen = self._gen
+        entry: Dict[Any, Any] = {"snap": bot.snapshot()}
+        with self._lock:
+            if gen == self._gen:
+                self._entry, self._ts = entry, time.monotonic()
+        return entry
+
+    def body(self, have: Optional[Dict[str, str]], gz: bool) -> Tuple[bytes, bool]:
+        e = self._current()
+        if have is None:
+            if "full" not in e:
+                e["full"] = _dumps(e["snap"])
+            body, variant = e["full"], "full"
+        else:
+            if "parts" not in e:
+                e["parts"] = _status_parts(e["snap"])
+            base, parts, sig = e["parts"]
+            chunks, same, variant = [base[:-1]], [], ["delta"]
+            for name in _STATUS_SECTIONS:
+                h = have.get(name)
+                if h is not None and (h == sig[name] or h == "-"):
+                    chunks.append(b',"' + name.encode() + b'":null')
+                    if h == sig[name]:
+                        same.append(name)
+                    variant.append("s" if h == sig[name] else "-")
+                else:
+                    chunks.append(b',"' + name.encode() + b'":' + parts[name])
+                    variant.append("+")
+            chunks.append(b',"same":' + _dumps(same) + b"}")
+            variant = "".join(variant)
+            body = e.get(variant) or b"".join(chunks)
+            e[variant] = body
+        if not gz or len(body) < _GZIP_MIN_BYTES:
+            return body, False
+        gz_key = ("gz", variant)
+        if gz_key not in e:
+            e[gz_key] = _gz(body)
+        return e[gz_key], True
+
+
+_STATUS_CACHE = _StatusCache(min(1.0, STATUS_POLL_MS / 2000.0))
 _LIVE_CACHE   = _JsonCache(min(0.5, LIVE_POLL_MS / 2000.0))
 
 
-def _json_response(body: bytes):
+def _json_response(body: bytes, compressed: bool = False):
     resp = Response(body, mimetype="application/json")
     resp.headers["Cache-Control"] = "no-store, max-age=0"
+    if compressed:
+        resp.headers["Content-Encoding"] = "gzip"
+    resp.vary.add("Accept-Encoding")
     return resp
 
 
@@ -8951,22 +9254,63 @@ def _fresh_after_write(resp):
     return resp
 
 
+@app.after_request
+def _compress(resp):
+    """Comprime con gzip el resto de respuestas JSON/HTML de más de 1 KB
+    (/api/stats, /api/trades, las respuestas de los ajustes…)."""
+    if (resp.status_code != 200 or resp.direct_passthrough or resp.is_streamed
+            or resp.headers.get("Content-Encoding")
+            or resp.mimetype not in ("application/json", "text/html", "text/plain")
+            or not _wants_gzip()):
+        return resp
+    data = resp.get_data()
+    if len(data) < _GZIP_MIN_BYTES:
+        return resp
+    packed = _gz(data)
+    if len(packed) >= len(data):
+        return resp
+    resp.set_data(packed)
+    resp.headers["Content-Encoding"] = "gzip"
+    resp.vary.add("Accept-Encoding")
+    return resp
+
+
+# La página (~170 KB) se sirve comprimida (~45 KB) y con ETag: al recargarla, si el
+# código no cambió, el navegador recibe un 304 sin cuerpo.
+_HTML_BYTES = HTML.encode("utf-8")
+_HTML_GZ    = gzip.compress(_HTML_BYTES, compresslevel=9, mtime=0)
+_HTML_ETAG  = hashlib.sha1(_HTML_BYTES).hexdigest()[:16]
+
+
 @app.get("/")
 def index():
-    resp = make_response(HTML)
-    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    gz = _wants_gzip()
+    etag = _HTML_ETAG + ("-gz" if gz else "")
+    if request.if_none_match.contains_weak(etag):
+        resp = Response(status=304)
+    else:
+        resp = Response(_HTML_GZ if gz else _HTML_BYTES, mimetype="text/html")
+        if gz:
+            resp.headers["Content-Encoding"] = "gzip"
+    resp.set_etag(etag)
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.vary.add("Accept-Encoding")
     return resp
 
 
 @app.get("/api/status")
 def api_status():
-    return _json_response(_STATUS_CACHE.get(bot.snapshot))
+    """Estado completo del panel. El panel pide ?have=… para no recibir otra vez el
+    historial, los cooldowns, el log y las señales frenadas si no cambiaron."""
+    body, packed = _STATUS_CACHE.body(_parse_have(request.args.get("have")), _wants_gzip())
+    return _json_response(body, packed)
 
 
 @app.get("/api/live")
 def api_live():
     """Payload mínimo (precio, cambio y PnL) para el refresco en vivo del navegador."""
-    return _json_response(_LIVE_CACHE.get(bot.live_payload))
+    body, packed = _LIVE_CACHE.get(bot.live_payload, _wants_gzip())
+    return _json_response(body, packed)
 
 
 @app.post("/api/close/<symbol>")
