@@ -1308,6 +1308,13 @@ STATS_MAX_IN_MEMORY = max(100, int(os.getenv("STATS_MAX_IN_MEMORY", "3000")))
 #  • Límite de exposición: no se abre una posición nueva si
 #    (notional abierto + notional del nuevo tramo) > max_exposure_usd.
 #    Con exposure_include_dca=True también frena los tramos DCA.
+#  • Equilibrio LONG/SHORT: cuenta las posiciones abiertas por su lado REAL
+#    (normales, invertidas y venganzas, más las aperturas con la orden en vuelo)
+#    y frena una posición NUEVA (cruce EMA o venganza) en el lado que ya va
+#    cargado: ningún lado pasa del balance_max_pct % de las posiciones abiertas
+#    (60 → 60/40, 50 → 50/50) salvo con balance_free_diff posiciones de
+#    diferencia o menos, para que puedan entrar las primeras. Ver _balance_cap.
+#    No frena el DCA: un tramo más no cambia el número de posiciones.
 #  • Filtros BTC 24h (dos, independientes):
 #      - bajista: BTCUSDT 24h < btc_filter_threshold (%) → frena btc_filter_mode
 #      - alcista: BTCUSDT 24h > btc_up_threshold     (%) → frena btc_up_mode
@@ -1348,6 +1355,11 @@ class RiskSettings:
     exposure_enabled:     bool  = _env_bool("MAX_EXPOSURE_ENABLED", True)
     max_exposure_usd:     float = float(os.getenv("MAX_EXPOSURE_USD", "800"))
     exposure_include_dca: bool  = _env_bool("MAX_EXPOSURE_INCLUDE_DCA", False)
+    # Equilibrio LONG/SHORT: ningún lado pasa del balance_max_pct % de las
+    # posiciones abiertas (60 = 60/40), salvo con balance_free_diff o menos de diferencia
+    balance_enabled:      bool  = _env_bool("BALANCE_ENABLED", True)
+    balance_max_pct:      float = float(os.getenv("BALANCE_MAX_PCT", "60") or 60)
+    balance_free_diff:    int   = int(float(os.getenv("BALANCE_FREE_DIFF", "2") or 2))
     # Filtro BTC bajista (BTC 24h < umbral)
     btc_filter_enabled:   bool  = _env_bool("BTC_FILTER_ENABLED", False)
     btc_filter_threshold: float = float(os.getenv("BTC_FILTER_THRESHOLD", "0"))
@@ -1368,6 +1380,10 @@ class RiskSettings:
 
 
 RISK = RiskSettings()
+# Valores de entorno fuera de rango → al rango válido (con 0 de diferencia libre no
+# podría abrirse ni la primera posición)
+RISK.balance_max_pct   = min(95.0, max(50.0, RISK.balance_max_pct))
+RISK.balance_free_diff = min(50, max(1, RISK.balance_free_diff))
 
 
 # ── Modo invertido (espejo del bot) ───────────────────────────────────────────
@@ -1397,7 +1413,8 @@ MODE = ModeSettings()
 #   • sin DCA, y si la venganza pierde no se venga otra vez (sin cadenas)
 # El TP y el SL se aplican también a las venganzas abiertas (salvo los fijados a
 # mano en la posición). Pasa por las mismas guardas que una entrada nueva (pausa,
-# exposición, filtros BTC sobre su lado real, memoria Upstash) y queda marcada
+# exposición, equilibrio LONG/SHORT y filtros BTC sobre su lado real, memoria
+# Upstash) y queda marcada
 # (revenge) en las posiciones, en el historial, en las estadísticas y en el CSV.
 @dataclass
 class RevengeSettings:
@@ -1496,6 +1513,9 @@ RISK_FIELDS = {
     "exposure_enabled":     _v_bool,
     "max_exposure_usd":     _v_float(1, 100_000_000, "La exposición máxima debe ser un número positivo (ej. 800)"),
     "exposure_include_dca": _v_bool,
+    "balance_enabled":      _v_bool,
+    "balance_max_pct":      _v_float(50, 95, "El reparto máximo va de 50 (50/50) a 95 (95/5)"),
+    "balance_free_diff":    _v_int(1, 50, "La diferencia libre debe ser un entero entre 1 y 50 posiciones"),
     "btc_filter_enabled":   _v_bool,
     "btc_filter_threshold": _v_float(-100, 100, "El umbral BTC debe estar entre -100 y 100 %"),
     "btc_filter_mode":      _v_mode,
@@ -1525,6 +1545,26 @@ def _apply_risk_dict(data: dict, strict: bool) -> Dict[str, Any]:
     for key, val in parsed.items():
         setattr(RISK, key, val)
     return parsed
+
+
+def _ratio_txt(max_pct: float) -> str:
+    """Reparto máximo del equilibrio en texto: 60 → "60/40"."""
+    p = float(max_pct)
+    return f"{p:g}/{100.0 - p:g}"
+
+
+def _balance_cap(n_other: int, max_pct: float, free_diff: int) -> int:
+    """Equilibrio LONG/SHORT: cuántas posiciones puede tener como mucho un lado
+    cuando el otro tiene `n_other`. Vale la regla que más permita de estas dos:
+      • diferencia libre: hasta n_other + free_diff (así entran las primeras);
+      • reparto: ese lado no pasa del max_pct % del total (60 → 60/40), es
+        decir, hasta ⌊n_other × max_pct / (100 − max_pct)⌋.
+    Con free_diff ≥ 1 el lado con menos posiciones (o cualquiera si van empatados)
+    siempre puede abrir: nunca quedan frenados los dos lados a la vez.
+    El panel web calcula lo mismo en balCap(): si cambias una, cambia la otra."""
+    p = float(max_pct)
+    by_share = floor(p / (100.0 - p) * n_other + 1e-9) if p < 100 else 10 ** 9
+    return max(int(n_other) + int(free_diff), int(by_share))
 
 
 def _v_loss_abs(v: Any) -> float:
@@ -2822,6 +2862,8 @@ class TradingBot:
         self._entry_inflight: set = set()                    # símbolos con una tanda de entradas en curso
         # (símbolo, nivel) → notional reservado antes de enviar la orden (cuenta para la exposición)
         self._entry_reserved: Dict[Tuple[str, float], float] = {}
+        # símbolo → lado REAL de una posición NUEVA con la orden en vuelo (cuenta para el equilibrio)
+        self._entry_reserved_side: Dict[str, str] = {}
         self._entry_backoff:  Dict[str, float] = {}
         self._close_backoff:  Dict[str, float] = {}
         self._log_throttle:   Dict[str, float] = {}
@@ -3020,6 +3062,10 @@ class TradingBot:
         g = RISK
         self.log(f"🛑 Stop global {'activo en ' + format(g.global_stop_usd, 'g') + ' USD' if g.global_stop_enabled else 'apagado'}"
                  f" · 🎯 TP global {'activo en +' + format(g.global_tp_usd, 'g') + ' USD' if g.global_tp_enabled else 'apagado'}")
+        self.log("⚖️ Equilibrio LONG/SHORT " + (
+            f"activo: reparto máximo {_ratio_txt(g.balance_max_pct)} entre las posiciones abiertas, "
+            f"con {g.balance_free_diff} de diferencia libre (no frena el DCA)"
+            if g.balance_enabled else "apagado"))
         if QSTASH_TOKEN:
             threading.Thread(target=_qstash_keepalive, args=(self.store, self.log),
                              daemon=True, name="QStashKeepAlive").start()
@@ -3165,12 +3211,12 @@ class TradingBot:
         if MAX_PRICE_BLOCK > 0 and price > MAX_PRICE_BLOCK:
             self._block_by_price(symbol, price)
             return
-        # Guardas de riesgo (pausa · exposición · filtro BTC): la señal se detectó
-        # igual que siempre; aquí solo se decide si puede abrir. El filtro BTC mira
-        # el lado de la SEÑAL: en modo invertido solo se abre el espejo de lo que el
-        # bot normal habría abierto.
+        # Guardas de riesgo (pausa · exposición · filtro BTC · equilibrio): la señal
+        # se detectó igual que siempre; aquí solo se decide si puede abrir. El filtro
+        # BTC mira el lado de la SEÑAL (en modo invertido solo se abre el espejo de lo
+        # que el bot normal habría abierto); el equilibrio, el lado REAL.
         first_level, first_notional = ENTRY_LADDER[0]
-        blocked = self._gate_check(signal_side, first_notional, is_dca=False)
+        blocked = self._gate_check(signal_side, first_notional, is_dca=False, real_side=side)
         if blocked is not None:
             self._record_block(symbol, side, blocked[0], blocked[1], is_dca=False,
                                extra=f"cruce {direction}" + (", invertida" if inverted else ""))
@@ -3191,6 +3237,50 @@ class TradingBot:
     def _exposure(self) -> float:
         with self.lock:
             return self._exposure_locked()
+
+    # ── Equilibrio LONG / SHORT ──────────────────────────────────────────────
+
+    def _side_counts_locked(self) -> Tuple[int, int]:
+        """(LONG, SHORT) abiertas por su lado REAL (normales, invertidas y venganzas)
+        más las posiciones nuevas con la orden de apertura en vuelo. Requiere self.lock."""
+        n_long = n_short = 0
+        for p in self.positions.values():
+            if p.status == "OPEN" and p.fills:
+                if p.direction == "LONG":
+                    n_long += 1
+                else:
+                    n_short += 1
+        for sym, side in self._entry_reserved_side.items():
+            p = self.positions.get(sym)
+            if p is not None and p.status == "OPEN" and p.fills:
+                continue                              # ya contada como posición
+            if side == "LONG":
+                n_long += 1
+            else:
+                n_short += 1
+        return n_long, n_short
+
+    def _side_counts(self) -> Tuple[int, int]:
+        with self.lock:
+            return self._side_counts_locked()
+
+    def _balance_block(self, real_side: str, counts: Optional[Tuple[int, int]] = None
+                       ) -> Optional[Tuple[str, str]]:
+        """("equilibrio", motivo) si una posición NUEVA en `real_side` (lado REAL)
+        dejaría ese lado demasiado cargado frente al otro (ver _balance_cap), o None.
+        Con self.lock tomado hay que pasar `counts` (de _side_counts_locked)."""
+        if not RISK.balance_enabled or real_side not in ("LONG", "SHORT"):
+            return None
+        n_long, n_short = counts if counts is not None else self._side_counts()
+        mine, other = (n_long, n_short) if real_side == "LONG" else (n_short, n_long)
+        cap = _balance_cap(other, RISK.balance_max_pct, RISK.balance_free_diff)
+        if mine + 1 <= cap:
+            return None
+        opp = _opp(real_side)
+        return ("equilibrio",
+                f"hay {mine} {real_side} y {other} {opp}; con {other} {opp} caben como mucho "
+                f"{cap} {real_side} (reparto máximo {_ratio_txt(RISK.balance_max_pct)}, "
+                f"diferencia libre {RISK.balance_free_diff})")
 
     def btc_change(self) -> Tuple[Optional[float], bool]:
         """(cambio 24h de BTCUSDT en %, dato fresco?). None si no hay dato."""
@@ -3316,11 +3406,15 @@ class TradingBot:
         return f"hasta las {cls._hhmm_utc(until)} (quedan {_fmt_secs(until - time.time())})"
 
     def _gate_check(self, side: str, notional: float, is_dca: bool,
-                    exposure: Optional[float] = None) -> Optional[Tuple[str, str]]:
+                    exposure: Optional[float] = None, real_side: Optional[str] = None,
+                    counts: Optional[Tuple[int, int]] = None) -> Optional[Tuple[str, str]]:
         """Devuelve (tipo, detalle) si la entrada NO puede abrirse, o None.
         `side` es el lado de la SEÑAL (el que abriría el bot normal), que es el
-        que mira el filtro BTC también en modo invertido.
-        NO toma self.lock salvo para calcular la exposición cuando no se pasa."""
+        que mira el filtro BTC también en modo invertido. `real_side` es el lado
+        REAL de la posición, el que cuenta para el equilibrio LONG/SHORT (si no se
+        pasa, `side`).
+        NO toma self.lock salvo para calcular la exposición y el reparto de
+        posiciones cuando no se pasan: con self.lock tomado, pasa exposure y counts."""
         if not is_dca and self._entries_paused_now():
             return "pausa", RISK.pause_reason or "entradas pausadas"
         if RISK.exposure_enabled and (not is_dca or RISK.exposure_include_dca):
@@ -3330,6 +3424,9 @@ class TradingBot:
                         f"exposición {exp:.2f} + {notional:.2f} > límite {RISK.max_exposure_usd:.2f} USDT")
         if not is_dca:
             blk = self._btc_side_block(side)
+            if blk is not None:
+                return blk
+            blk = self._balance_block(real_side or side, counts)
             if blk is not None:
                 return blk
         return None
@@ -3917,13 +4014,17 @@ class TradingBot:
                   or pos.inverted != inverted or pos.revenge or revenge is not None
                   or len(pos.fills) != idx):              # el tramo idx solo sigue al idx-1
                 return False
-            # Comprobación definitiva de las guardas (con la exposición real, incluidas
-            # las órdenes en vuelo de otros símbolos) justo antes de reservar.
+            # Comprobación definitiva de las guardas (con la exposición real y el reparto
+            # LONG/SHORT real, incluidas las órdenes en vuelo de otros símbolos) justo
+            # antes de reservar: dos cruces a la vez no pueden pasarse del equilibrio.
             blocked = self._gate_check(_opp(direction) if inverted else direction, notional,
-                                       is_dca, exposure=self._exposure_locked())
+                                       is_dca, exposure=self._exposure_locked(),
+                                       real_side=direction, counts=self._side_counts_locked())
             if blocked is None:
                 trade_id = pos.trade_id if (pos is not None and pos.trade_id) else 0
                 self._entry_reserved[key] = notional
+                if idx == 0:                              # posición nueva: ya cuenta para el equilibrio
+                    self._entry_reserved_side[symbol] = direction
         if blocked is not None:
             if revenge is not None:
                 self._record_block(symbol, direction, blocked[0], blocked[1], is_dca=False,
@@ -3931,7 +4032,8 @@ class TradingBot:
                                    what="venganza", log=False)
                 return _fail(f"{blocked[0]}: {blocked[1]}")
             self._record_block(symbol, direction, blocked[0], blocked[1], is_dca=is_dca,
-                               extra=f"tramo {idx + 1} al {level:g}%")
+                               extra=("1.er tramo" + (", invertida" if inverted else "")) if idx == 0
+                               else f"tramo {idx + 1} al {level:g}%")
             return False
 
         try:
@@ -4017,6 +4119,8 @@ class TradingBot:
         finally:
             with self.lock:
                 self._entry_reserved.pop(key, None)
+                if idx == 0:
+                    self._entry_reserved_side.pop(symbol, None)
 
     async def _close_position(self, symbol: str, price: float, reason: str,
                               acquired: bool = False) -> bool:
@@ -5393,6 +5497,7 @@ class TradingBot:
             exposure = sum(p.notional for p in self.positions.values()
                            if p.status == "OPEN" and p.fills)
             unreal_n, n_n, unreal_i, n_i = self._unrealized_books_locked()
+            side_counts = self._side_counts_locked()           # (LONG, SHORT) por lado REAL
         unreal, n_open = unreal_n + unreal_i, n_n + n_i
         btc_chg, btc_fresh = self.btc_change()
         blk_long, blk_short, btc_reasons = self._btc_blocks()     # por lado de la SEÑAL
@@ -5400,6 +5505,9 @@ class TradingBot:
         # Lados REALES que pueden abrir: en modo invertido un LONG real sale de una
         # señal SHORT (y al revés), así que lo frena lo que frene a esa señal.
         real_blk_long, real_blk_short = (blk_short, blk_long) if inv_mode else (blk_long, blk_short)
+        # El equilibrio ya va por lado REAL
+        bal_blk_long = self._balance_block("LONG", side_counts) is not None
+        bal_blk_short = self._balance_block("SHORT", side_counts) is not None
         first_nt = ENTRY_LADDER[0][1] if ENTRY_LADDER else 0.0
         exp_blocks = bool(RISK.exposure_enabled
                           and exposure + first_nt > RISK.max_exposure_usd + 1e-9)
@@ -5420,6 +5528,13 @@ class TradingBot:
             "max_exposure":      RISK.max_exposure_usd,
             "exposure_include_dca": RISK.exposure_include_dca,
             "exposure_blocks":   exp_blocks,
+            "balance_enabled":   RISK.balance_enabled,
+            "balance_max_pct":   RISK.balance_max_pct,
+            "balance_free_diff": RISK.balance_free_diff,
+            "n_long":            side_counts[0],
+            "n_short":           side_counts[1],
+            "balance_blocks_long":  bal_blk_long,
+            "balance_blocks_short": bal_blk_short,
             "btc_symbol":        BTC_FILTER_SYMBOL,
             "btc_enabled":       RISK.btc_filter_enabled,
             "btc_change":        btc_chg,
@@ -5456,8 +5571,8 @@ class TradingBot:
             "open_inverted":     n_i,
             "inverted_mode":     inv_mode,
             "inverted_since":    MODE.changed_at,
-            "can_open_long":     not (common or real_blk_long),
-            "can_open_short":    not (common or real_blk_short),
+            "can_open_long":     not (common or real_blk_long or bal_blk_long),
+            "can_open_short":    not (common or real_blk_short or bal_blk_short),
         }
         with self._block_lock:
             view["blocked_counts"] = dict(self.blocked_counts)
@@ -6222,9 +6337,10 @@ HTML = r"""<!doctype html>
     .readout dt { color: var(--muted); font-size: 13px; }
     .readout dd { margin: 0; font-family: var(--font-c); font-weight: 600; font-size: 19px; }
 
-    .interlocks { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+    .interlocks { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .il { position: relative; padding: 16px 18px 18px; border-left: 1px solid var(--rule); display: flex; flex-direction: column; gap: 6px; text-align: left; background: none; border-top: 0; border-right: 0; border-bottom: 0; cursor: pointer; min-width: 0; }
-    .il:first-child { border-left: 0; }
+    .il:nth-child(3n+1) { border-left: 0; }
+    .il:nth-child(n+4) { border-top: 1px solid var(--rule); }
     .il:hover { background: rgba(255,255,255,.025); }
     .il-head { display: flex; align-items: center; gap: 9px; font-size: 14px; color: var(--muted); font-weight: 500; }
     .il-val { font-family: var(--font-c); font-weight: 700; font-size: 24px; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -6234,6 +6350,13 @@ HTML = r"""<!doctype html>
     .il-bar i { display: block; height: 100%; width: 0; background: var(--ok); transition: width .3s, background .3s; }
     .il[data-state="warn"] .il-bar i { background: var(--warn); }
     .il[data-state="bad"]  .il-bar i { background: var(--bad); }
+    /* Equilibrio: barra partida LONG (izquierda) / SHORT (derecha) */
+    .il-split { display: flex; height: 4px; border-radius: 2px; background: var(--rule); overflow: hidden; margin-top: 2px; }
+    .il-split i { display: block; height: 100%; width: 0; transition: width .3s; }
+    .il-split .l { background: var(--long); }
+    .il-split .s { background: var(--short); margin-left: auto; }
+    .il-val .sep { color: var(--dim); font-weight: 500; margin: 0 9px; }
+    .c-long { color: var(--long); } .c-short { color: var(--short); }
     .il[data-state="bad"]::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--bad); }
     .il[data-state="warn"]::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--warn); }
     .sides { display: flex; gap: 6px; margin-top: 2px; }
@@ -6480,6 +6603,7 @@ HTML = r"""<!doctype html>
     }
     @media (max-width: 860px) {
       .interlocks { grid-template-columns: 1fr 1fr; }
+      .il:nth-child(n) { border-left: 1px solid var(--rule); border-top: 0; }
       .il:nth-child(odd) { border-left: 0; }
       .il:nth-child(n+3) { border-top: 1px solid var(--rule); }
       .il:last-child:nth-child(odd) { grid-column: 1 / -1; }
@@ -6570,6 +6694,12 @@ HTML = r"""<!doctype html>
         <span class="il-head"><i class="lamp off"></i>Exposición</span>
         <span class="il-val" data-v>—</span>
         <span class="il-bar"><i data-b></i></span>
+        <span class="il-sub" data-s></span>
+      </button>
+      <button class="il" id="ilBalance" data-go="cfg-balance" data-state="off">
+        <span class="il-head"><i class="lamp off"></i>Equilibrio</span>
+        <span class="il-val" data-v>—</span>
+        <span class="il-split" aria-hidden="true"><i class="l" data-bl></i><i class="s" data-bs></i></span>
         <span class="il-sub" data-s></span>
       </button>
       <button class="il" id="ilBtc" data-go="cfg-btc,cfg-btcup" data-state="off">
@@ -6722,6 +6852,35 @@ HTML = r"""<!doctype html>
           </div>
         </details>
 
+        <details class="acc" id="cfg-balance">
+          <summary><span class="acc-name">Equilibrio LONG / SHORT</span><span class="acc-val" id="cvBalance">—</span><span class="chev"></span></summary>
+          <div class="acc-body" data-panel>
+            <p class="hint">Cuenta las posiciones abiertas por su lado real (también las invertidas y las de venganza) y frena las posiciones nuevas, de un cruce EMA o de una venganza, en el lado que ya va cargado. Las abiertas siguen con su TP, SL y DCA.</p>
+            <label class="switch"><input type="checkbox" id="balEnabled"><span class="track"></span>Equilibrio activado</label>
+            <div class="field-row">
+              <div class="field">
+                <label for="balMax">Reparto máximo</label>
+                <select id="balMax">
+                  <option value="50">50/50</option>
+                  <option value="55">55/45</option>
+                  <option value="60">60/40</option>
+                  <option value="65">65/35</option>
+                  <option value="70">70/30</option>
+                  <option value="75">75/25</option>
+                  <option value="80">80/20</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="balFree">Diferencia libre</label>
+                <input id="balFree" type="number" step="1" min="1" max="50" inputmode="numeric" placeholder="2">
+              </div>
+            </div>
+            <p class="hint" id="balExplain">—</p>
+            <div class="chips" id="balPreview"></div>
+            <button class="btn primary" id="balSave">Guardar equilibrio</button>
+          </div>
+        </details>
+
         <details class="acc" id="cfg-btc">
           <summary><span class="acc-name">Filtro BTC bajista</span><span class="acc-val" id="cvBtc">—</span><span class="chev"></span></summary>
           <div class="acc-body" data-panel>
@@ -6797,7 +6956,7 @@ HTML = r"""<!doctype html>
         <details class="acc" id="cfg-rev">
           <summary><span class="acc-name">Trade de venganza</span><span class="acc-val" id="cvRev">—</span><span class="chev"></span></summary>
           <div class="acc-body" data-panel>
-            <p class="hint">Cuando una operación cierra por su stop loss con una pérdida dentro de este rango, el bot abre al momento la posición contraria en el mismo símbolo con el notional multiplicado. Su take profit es la pérdida de la original multiplicada (×1 la recupera justo) o una ganancia fija en USD, y su stop loss es fijo. No hace DCA y, si pierde, no se venga otra vez. Pasa por la pausa, la exposición y los filtros BTC como cualquier entrada nueva.</p>
+            <p class="hint">Cuando una operación cierra por su stop loss con una pérdida dentro de este rango, el bot abre al momento la posición contraria en el mismo símbolo con el notional multiplicado. Su take profit es la pérdida de la original multiplicada (×1 la recupera justo) o una ganancia fija en USD, y su stop loss es fijo. No hace DCA y, si pierde, no se venga otra vez. Pasa por la pausa, la exposición, el equilibrio LONG / SHORT y los filtros BTC como cualquier entrada nueva.</p>
             <label class="switch"><input type="checkbox" id="rvEnabled"><span class="track"></span>Venganza activada</label>
             <div class="field-row">
               <div class="field"><label for="rvMin">Pérdida mínima (USD)</label><input id="rvMin" type="number" step="0.1" min="0.01" inputmode="decimal" placeholder="1"></div>
@@ -7176,12 +7335,11 @@ function renderGate(g) {
   else if (!g.can_open_long && !g.can_open_short) {
     st = 'bad'; val = 'Bloqueadas';
     sub = g.exposure_blocks ? 'Exposición al límite'
+        : (g.balance_blocks_long || g.balance_blocks_short) ? sideBlockTxt(g)
         : (g.btc_change === null || !g.btc_fresh) ? 'Filtro BTC sin dato fresco' : 'El filtro BTC frena todo';
   } else if (!g.can_open_long || !g.can_open_short) {
     st = 'warn'; val = 'Solo ' + (g.can_open_long ? 'LONG' : 'SHORT');
-    const realBlocked = g.can_open_long ? 'SHORT' : 'LONG';
-    sub = inv ? `El filtro BTC frena las señales ${realBlocked === 'LONG' ? 'SHORT' : 'LONG'}, que abrirían ${realBlocked}`
-              : `El filtro BTC frena ${realBlocked}`;
+    sub = sideBlockTxt(g);
   }
   tile('ilEntries', st, val, sub);
   setHTML(q('ilEntries').querySelector('[data-sides]'),
@@ -7207,6 +7365,29 @@ function renderGate(g) {
   tile('ilExposure', st, val, sub, g.exposure_enabled ? ratio : 0);
   setTxt('cvExposure', g.exposure_enabled ? `${fx(mx, 0)} USDT` + (g.exposure_include_dca ? ' con DCA' : '') : 'Apagado');
   q('cvExposure').classList.toggle('on', !!g.exposure_enabled);
+
+  // 2b) Equilibrio LONG / SHORT (posiciones abiertas por su lado real)
+  const nl = n(g.n_long), ns = n(g.n_short), nTot = nl + ns;
+  const balP = n(g.balance_max_pct) || 60, balD = n(g.balance_free_diff) || 2;
+  const balL = !!g.balance_blocks_long, balS = !!g.balance_blocks_short;
+  const shareL = nTot ? Math.round(nl / nTot * 100) : 0;
+  st = !g.balance_enabled ? 'off' : (balL || balS) ? 'warn' : 'ok';
+  val = `<span class="c-long">${nl}</span><small>LONG</small><span class="sep">·</span><span class="c-short">${ns}</span><small>SHORT</small>`;
+  if (!g.balance_enabled) sub = nTot ? `Desactivado. Reparto ${shareL}/${100 - shareL}` : 'Desactivado';
+  else if (balL || balS) {
+    const full = balL ? 'LONG' : 'SHORT', other = balL ? 'SHORT' : 'LONG';
+    sub = `Frena ${full} hasta que abran más ${other} o cierre algún ${full}`;
+  } else {
+    sub = `Caben ${Math.max(0, balCap(ns, balP, balD) - nl)} LONG o ${Math.max(0, balCap(nl, balP, balD) - ns)} SHORT más`;
+  }
+  tile('ilBalance', st, val, sub);
+  q('ilBalance').querySelector('[data-bl]').style.width = (nTot ? nl / nTot * 100 : 0).toFixed(1) + '%';
+  q('ilBalance').querySelector('[data-bs]').style.width = (nTot ? ns / nTot * 100 : 0).toFixed(1) + '%';
+  setTxt('cvBalance', g.balance_enabled ? `${ratioTxt(balP)} (±${balD})` : 'Apagado');
+  q('cvBalance').classList.toggle('on', !!g.balance_enabled);
+  fillChk('balEnabled', g.balance_enabled); fillSel('balMax', balP); fillVal('balFree', balD);
+  const balSig = [g.balance_enabled, balP, balD, nl, ns].join('|');
+  if (balSig !== _balSig) { _balSig = balSig; balExplain(); }
 
   // 3) BTC 24h (filtro bajista + filtro alcista)
   const chg = g.btc_change;
@@ -7629,7 +7810,8 @@ function render(d) {
 
   // Señales frenadas
   const g = d.gate || {};
-  const KIND = { pausa: 'Pausa', exposicion: 'Exposición', btc: 'Filtro BTC', btc_down: 'Filtro BTC bajista',
+  const KIND = { pausa: 'Pausa', exposicion: 'Exposición', equilibrio: 'Equilibrio LONG/SHORT',
+                 btc: 'Filtro BTC', btc_down: 'Filtro BTC bajista',
                  btc_up: 'Filtro BTC alcista', ema_dca: 'Condición EMA', memoria: 'Memoria Upstash',
                  cierre: 'Cierre masivo', precio: 'Falta de precio' };
   const WHAT = { DCA: 'un DCA', venganza: 'la venganza' };
@@ -8039,6 +8221,69 @@ function saveEmaDca() {
   const on = q('edEnabled').checked;
   saveRisk('edSave', { dca_ema_enabled: on, dca_ema_period: p, dca_ema_after: a },
     on ? `Condición EMA ${p} activa desde el tramo ${a + 1}` : 'Condición EMA del DCA desactivada');
+}
+
+// ── Equilibrio LONG / SHORT ─────────────────────────────────────────────────
+// Tope de posiciones de un lado con `other` abiertas en el otro. Es la misma
+// fórmula que _balance_cap() en el servidor: si cambias una, cambia la otra.
+function balCap(other, p, d) {
+  return Math.max(other + d, p >= 100 ? Infinity : Math.floor(p / (100 - p) * other + 1e-9));
+}
+const ratioTxt = p => `${fmtN(p, 1)}/${fmtN(100 - n(p), 1)}`;
+// <select> que puede recibir un valor fuera de sus opciones (p. ej. 62.5 puesto en Environment)
+function fillSel(id, v) {
+  const el = q(id); if (!el || isEditing(el)) return;
+  const s = String(n(v));
+  if (![...el.options].some(o => o.value === s)) {
+    const o = document.createElement('option'); o.value = s; o.textContent = ratioTxt(n(v)); el.appendChild(o);
+  }
+  if (el.value !== s) el.value = s;
+}
+// Qué frena cada lado REAL en "Entradas nuevas" (en modo invertido un LONG real sale de una señal SHORT)
+function sideBlockTxt(g) {
+  const inv = !!g.inverted_mode;
+  const sides = (l, s) => l && s ? 'LONG y SHORT' : l ? 'LONG' : 'SHORT';
+  const realL = inv ? g.btc_blocks_short : g.btc_blocks_long, realS = inv ? g.btc_blocks_long : g.btc_blocks_short;
+  const parts = [];
+  if (g.balance_blocks_long || g.balance_blocks_short) parts.push(`el equilibrio frena ${g.balance_blocks_long ? 'LONG' : 'SHORT'}`);
+  if (realL || realS) parts.push(inv ? `el filtro BTC frena las señales ${sides(g.btc_blocks_long, g.btc_blocks_short)}, que abrirían ${sides(realL, realS)}`
+                                     : `el filtro BTC frena ${sides(realL, realS)}`);
+  const s = parts.join(' y ');
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+}
+let _balSig = '';
+function balExplain() {
+  const on = q('balEnabled').checked, p = numVal('balMax'), d = numVal('balFree');
+  if (!(p >= 50 && p <= 95) || !(Number.isInteger(d) && d >= 1 && d <= 50)) {
+    setTxt('balExplain', 'El reparto va de 50/50 a 95/5 y la diferencia libre es un número entero de 1 a 50.');
+    setHTML(q('balPreview'), '');
+    return;
+  }
+  const g = _gate || {}, nl = n(g.n_long), ns = n(g.n_short);
+  const rule = p <= 50
+    ? `un lado puede llevarle como mucho ${d} ${d === 1 ? 'posición' : 'posiciones'} al otro`
+    : `ningún lado puede pasar del ${fmtN(p, 1)} % de las posiciones abiertas, salvo que le lleve ${d} o menos al otro (así entran las primeras)`;
+  let now = '';
+  if (!on) now = nl + ns ? ` Ahora hay ${nl} LONG y ${ns} SHORT.` : '';
+  else {
+    const xl = Math.max(0, balCap(ns, p, d) - nl), xs = Math.max(0, balCap(nl, p, d) - ns);
+    now = ` Con lo abierto ahora (${nl} LONG y ${ns} SHORT) `
+      + (!xl ? `se frenan los LONG y caben ${xs} SHORT más.` : !xs ? `se frenan los SHORT y caben ${xl} LONG más.`
+         : `caben ${xl} LONG más o ${xs} SHORT más.`);
+  }
+  setTxt('balExplain', (on ? 'Activo: ' : 'Apagado. Al activarlo, ') + rule + '.' + now
+    + ' Tope de LONG según los SHORT abiertos (igual al revés):');
+  setHTML(q('balPreview'), [0, 2, 5, 10, 20].map(b =>
+    `<span class="chip">${b} SHORT → <b>${balCap(b, p, d)}</b> LONG</span>`).join(''));
+}
+function saveBalance() {
+  const p = numVal('balMax'), d = numVal('balFree'), on = q('balEnabled').checked;
+  if (!(p >= 50 && p <= 95)) { toast('El reparto máximo va de 50/50 a 95/5.', 'bad'); return; }
+  if (!(Number.isInteger(d) && d >= 1 && d <= 50)) {
+    toast('La diferencia libre debe ser un número entero de 1 a 50.', 'bad'); q('balFree').focus(); return;
+  }
+  saveRisk('balSave', { balance_enabled: on, balance_max_pct: p, balance_free_diff: d },
+    on ? `Equilibrio activo: máximo ${ratioTxt(p)}, diferencia libre ${d}` : 'Equilibrio desactivado');
 }
 
 // ── Escalera DCA editable ───────────────────────────────────────────────────
@@ -8476,6 +8721,8 @@ document.addEventListener('DOMContentLoaded', () => {
   q('btcUpSave').addEventListener('click', saveBtcUp);
   q('edSave').addEventListener('click', saveEmaDca);
   ['edEnabled', 'edPeriod', 'edAfter'].forEach(id => ['input', 'change'].forEach(ev => q(id).addEventListener(ev, edExplain)));
+  q('balSave').addEventListener('click', saveBalance);
+  ['balEnabled', 'balMax', 'balFree'].forEach(id => ['input', 'change'].forEach(ev => q(id).addEventListener(ev, balExplain)));
 
   // Escalera DCA: edición sobre la misma celda, borrar, añadir, guardar, restaurar
   const tb = q('tbDca');
@@ -9046,6 +9293,7 @@ def api_set_risk():
     {"global_stop_enabled": true, "global_stop_usd": -5}
     {"global_tp_enabled": true, "global_tp_usd": 10, "global_tp_pause": true, "global_tp_pause_min": 60}
     {"exposure_enabled": true, "max_exposure_usd": 800, "exposure_include_dca": false}
+    {"balance_enabled": true, "balance_max_pct": 60, "balance_free_diff": 2}   (60/40)
     {"btc_filter_enabled": true, "btc_filter_threshold": 0, "btc_filter_mode": "all"}
     {"btc_up_enabled": true, "btc_up_threshold": 0, "btc_up_mode": "short"}
     {"dca_ema_enabled": true, "dca_ema_period": 500, "dca_ema_after": 3}"""
